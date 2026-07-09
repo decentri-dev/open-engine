@@ -6,6 +6,7 @@ use open_engine_core::domain::{
 };
 use open_engine_core::encoding::Eip8141Encoder;
 use open_engine_core::gateway::{ChainGateway, GatewayError};
+use open_engine_core::policy::SponsorPolicy;
 use open_engine_core::signer::Signer;
 use std::sync::Arc;
 use thiserror::Error;
@@ -19,6 +20,8 @@ pub enum CompilerError {
     Simulation(String),
     #[error("Failed to sign frame: {0}")]
     Signing(String),
+    #[error("Sponsor policy rejected the transaction: {0}")]
+    Policy(String),
 }
 
 /// The Compiler acts as the gateway between the API and the Queue.
@@ -28,13 +31,23 @@ pub enum CompilerError {
 pub struct FrameCompiler<G, S> {
     gateway: Arc<G>,
     sponsor_signer: Arc<S>,
+    policy: SponsorPolicy,
 }
 
 impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S> {
+    /// Builds a compiler with no sponsor policy (the `gated` default). Every
+    /// guard is off; use [`with_policy`](Self::with_policy) to enable them.
     pub fn new(gateway: Arc<G>, sponsor_signer: Arc<S>) -> Self {
+        Self::with_policy(gateway, sponsor_signer, SponsorPolicy::permissive())
+    }
+
+    /// Builds a compiler that enforces `policy` before signing any sponsored
+    /// transaction.
+    pub fn with_policy(gateway: Arc<G>, sponsor_signer: Arc<S>, policy: SponsorPolicy) -> Self {
         Self {
             gateway,
             sponsor_signer,
+            policy,
         }
     }
 
@@ -417,6 +430,20 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
             }
         }
 
+        // Conformance cross-check: our locally-computed max_cost must match the
+        // node's. A mismatch means our wire encoding or gas formula has drifted
+        // from the node's — the same class of silent bug that the missing
+        // `recent_root_references` field caused. Warn rather than reject, since
+        // the node's value is authoritative and this is a drift alarm.
+        let local_max_cost = tx.max_cost();
+        if local_max_cost != sim.max_cost {
+            warn!(
+                local_max_cost = %local_max_cost,
+                node_max_cost = %sim.max_cost,
+                "max_cost mismatch between local computation and node: wire encoding or gas formula may have drifted from the node"
+            );
+        }
+
         info!(
             prefix_shape = sim.prefix_shape.as_deref().unwrap_or("<unknown>"),
             payer = ?sim.payer,
@@ -426,59 +453,70 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
         Ok(())
     }
 
-    /// Finds an empty VERIFY frame meant for the sponsor and signs it.
+    /// Signs the paymaster VERIFY frame that this signer owns, if present.
+    ///
+    /// The sponsor frame is identified by its target matching **our own signer
+    /// address** — not merely "any non-sender VERIFY frame". A VERIFY frame
+    /// pointing at some other address is a foreign paymaster arrangement whose
+    /// signature that party supplies; we must never attach our sponsor signature
+    /// to a frame we do not control. Before signing, the sponsor policy is
+    /// consulted (spend ceiling, allowlist, quota) since sponsoring makes this
+    /// signer the payer.
     async fn inject_sponsor_signature(
         &self,
         tx: &mut FrameTransaction,
     ) -> Result<(), CompilerError> {
-        // Find a VERIFY frame that does NOT target the sender (implies it is the Paymaster frame).
-        // It must also NOT be the Expiry Verifier frame.
-        let mut sponsor_frame_index = None;
-        let mut sponsor_address = String::new();
-        for (i, frame) in tx.frames.iter().enumerate() {
-            let target_addr = frame.target.as_deref().unwrap_or("").to_lowercase();
-            let is_expiry_verifier = target_addr == EXPIRY_VERIFIER_ADDRESS.to_lowercase();
+        // Our sponsor identity — the account whose key we hold. Lowercased hex
+        // (`0x…`) so it compares case-insensitively with a frame target.
+        let our_address = format!("{:#x}", self.sponsor_signer.address());
 
-            if matches!(frame.mode, FrameMode::Verify)
-                && !is_expiry_verifier
-                && frame.target.as_deref() != Some(tx.sender.as_str())
-            {
-                sponsor_frame_index = Some(i);
-                sponsor_address = frame.target.clone().unwrap_or_default();
-                break;
-            }
-        }
+        let sponsor_frame_index = tx.frames.iter().position(|frame| {
+            let target = frame.target.as_deref().unwrap_or("").to_lowercase();
+            let is_expiry_verifier = target == EXPIRY_VERIFIER_ADDRESS.to_lowercase();
+            matches!(frame.mode, FrameMode::Verify) && !is_expiry_verifier && target == our_address
+        });
 
-        if let Some(index) = sponsor_frame_index {
+        let Some(index) = sponsor_frame_index else {
             info!(
-                "Found Sponsor VERIFY frame at index {}. Injecting signature.",
-                index
+                "No sponsor VERIFY frame targets this signer ({our_address}); treating as self-relay or foreign sponsorship."
             );
+            return Ok(());
+        };
 
-            // Compute hash BEFORE mutating signatures
-            let sig_hash = open_engine_core::encoding::Eip8141Encoder::compute_sig_hash(tx);
-            let signature = self
-                .sponsor_signer
-                .sign_hash(&sig_hash)
-                .await
-                .map_err(|e| CompilerError::Signing(e.to_string()))?;
+        info!(
+            "Found sponsor VERIFY frame at index {index} targeting this signer; enforcing policy before signing."
+        );
 
-            // Find the existing sponsor signature entry in tx.signatures to avoid changing RLP structure
-            let sponsor_sig_opt = tx
-                .signatures
-                .iter_mut()
-                .find(|sig| sig.signer == sponsor_address);
+        // Sponsoring makes us the payer, so guard sponsor spend BEFORE signing.
+        self.policy
+            .check(tx)
+            .await
+            .map_err(|e| CompilerError::Policy(e.to_string()))?;
 
-            if let Some(sponsor_sig) = sponsor_sig_opt {
-                // Inject the signature into the existing placeholder
-                sponsor_sig.signature = alloy::hex::encode(signature);
-            } else {
-                return Err(CompilerError::Signing(
-                    "Sponsor signature entry missing from transaction signatures. Cannot inject signature without breaking canonical hash.".to_string(),
-                ));
+        // Compute hash BEFORE mutating signatures (signature bytes are elided
+        // from the canonical hash, so filling the placeholder does not change it).
+        let sig_hash = Eip8141Encoder::compute_sig_hash(tx);
+        let signature = self
+            .sponsor_signer
+            .sign_hash(&sig_hash)
+            .await
+            .map_err(|e| CompilerError::Signing(e.to_string()))?;
+
+        // Fill the existing placeholder entry (matched by our address) rather
+        // than pushing a new one, so the RLP signature list — and thus the
+        // canonical hash — is unchanged.
+        let sponsor_sig = tx
+            .signatures
+            .iter_mut()
+            .find(|sig| sig.signer.to_lowercase() == our_address);
+
+        match sponsor_sig {
+            Some(sponsor_sig) => sponsor_sig.signature = alloy::hex::encode(signature),
+            None => {
+                return Err(CompilerError::Signing(format!(
+                    "sponsor signature entry for {our_address} is missing; the transaction must pre-allocate the signature placeholder so the canonical hash is stable"
+                )))
             }
-        } else {
-            info!("No Sponsor VERIFY frame found. Treating as Self-Relay.");
         }
 
         Ok(())

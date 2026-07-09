@@ -16,5 +16,11 @@ queue = { path = "../queue" }
 broadcaster = { path = "../broadcaster" }
 alloy = { version = "2.0.4", features = ["serde", "signers", "rpc", "transports"] }
 
+[features]
+# Forward KMS sponsor-signer backends to core. The cloud SDKs are pulled in
+# transitively via core's alloy KMS features; a default build enables neither.
+signer-aws = ["open_engine_core/signer-aws"]
+signer-gcp = ["open_engine_core/signer-gcp"]
+
 [dev-dependencies]
 tokio = { workspace = true }

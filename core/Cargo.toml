@@ -12,6 +12,12 @@ alloy = { version = "2.0.4", features = ["serde", "signers", "rlp", "signer-loca
 [features]
 # Exposes MockGateway and other in-memory test doubles for downstream test suites.
 test-utils = []
+# KMS-backed sponsor signers. These only pull in alloy's KMS signer sub-crates so
+# the `SponsorSigner` variants can be named/dispatched here; the cloud client SDKs
+# needed to *construct* them live in the `api` crate where the factory runs. Off by
+# default, so a plain `cargo build` never compiles a cloud SDK.
+signer-aws = ["alloy/signer-aws"]
+signer-gcp = ["alloy/signer-gcp"]
 
 [dev-dependencies]
 tokio = { workspace = true }
