@@ -13,7 +13,7 @@ pub enum SignerError {
 /// By placing this behind a trait, we can use in-memory keys for testing/local,
 /// and swap in a TEE (Hardware Enclave) or UDS-sidecar for production later.
 pub trait Signer: Send + Sync {
-    /// Takes an EIP-8141 sig_hash and returns a raw signature (typically 65 bytes: r + s + v)
+    /// Takes an EIP-8141 sig_hash and returns a raw frame signature as v || r || s.
     fn sign_hash(&self, hash: &B256) -> impl Future<Output = Result<Bytes, SignerError>> + Send;
 }
 
@@ -40,7 +40,12 @@ impl Signer for InMemorySigner {
             .await
             .map_err(|e| SignerError::SignError(e.to_string()))?;
 
-        Ok(Bytes::from(signature.as_bytes().to_vec()))
+        let rsv = signature.as_bytes();
+        let mut vrs = Vec::with_capacity(65);
+        vrs.push(rsv[64]);
+        vrs.extend_from_slice(&rsv[..64]);
+
+        Ok(Bytes::from(vrs))
     }
 }
 
@@ -50,7 +55,7 @@ mod tests {
     use alloy::primitives::b256;
 
     #[test]
-    fn test_in_memory_signer_invalid_key() {
+    fn in_memory_signer_invalid_key() {
         let result = InMemorySigner::new("invalid_hex_key");
         assert!(result.is_err());
         match result {
@@ -62,15 +67,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_in_memory_signer_sign_hash() {
+    async fn in_memory_signer_sign_hash() {
         let pk_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let signer = InMemorySigner::new(pk_hex).expect("Failed to create signer");
-        
+
         let hash = b256!("0000000000000000000000000000000000000000000000000000000000000000");
         let result = signer.sign_hash(&hash).await;
-        
+
         assert!(result.is_ok());
         let signature = result.unwrap();
         assert_eq!(signature.len(), 65);
+        assert!(
+            signature[0] == 27 || signature[0] == 28,
+            "Frame signatures are encoded as v || r || s"
+        );
     }
 }

@@ -1,72 +1,55 @@
-use alloy::primitives::{Address, Bytes, B256, address};
-use open_engine_core::domain::{Frame, FrameMode, FrameTransaction};
-use open_engine_core::gateway::{ChainGateway, GatewayError};
-use open_engine_core::signer::{InMemorySigner, Signer};
-use compiler::FrameCompiler;
+mod common;
+use common::{MockGateway, DUMMY_SENDER, SPONSOR_KEY};
+
+use alloy::primitives::{B256};
 use broadcaster::MempoolBroadcaster;
-use queue::{DurableExecution, job::BorrowedJob};
+use compiler::FrameCompiler;
+use open_engine_core::domain::{Frame, FrameMode, FrameSignature, FrameTransaction};
+use open_engine_core::signer::InMemorySigner;
+use queue::DurableExecution;
 use std::sync::Arc;
-use std::future::Future;
-
-/// A simple mock gateway for testing vertical slices.
-struct MockGateway {
-    nonce: u64,
-    gas_limit: u64,
-    tx_hash: B256,
-}
-
-impl ChainGateway for MockGateway {
-    fn get_transaction_count(&self, _address: Address) -> impl Future<Output = Result<u64, GatewayError>> + Send {
-        async move { Ok(self.nonce) }
-    }
-
-    fn estimate_gas(&self, _tx: &FrameTransaction) -> impl Future<Output = Result<u64, GatewayError>> + Send {
-        async move { Ok(self.gas_limit) }
-    }
-
-    fn send_raw_transaction(&self, _bytes: Bytes) -> impl Future<Output = Result<B256, GatewayError>> + Send {
-        async move { Ok(self.tx_hash) }
-    }
-}
 
 #[tokio::test]
-async fn test_self_relay_vertical_slice() {
+async fn compiles_and_queues_self_relay_tx() {
     // 1. Setup
     let gateway = Arc::new(MockGateway {
         nonce: 42,
         gas_limit: 21000,
         tx_hash: B256::repeat_byte(0xaa),
     });
-    
+
     // Use a dummy key for the sponsor signer
-    let sponsor_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let sponsor_signer = Arc::new(InMemorySigner::new(sponsor_key).unwrap());
+    let sponsor_signer = Arc::new(InMemorySigner::new(SPONSOR_KEY).unwrap());
 
     let compiler = FrameCompiler::new(gateway.clone(), sponsor_signer.clone());
-    let broadcaster = MempoolBroadcaster::new(gateway.clone(), sponsor_signer.clone());
+    let broadcaster = MempoolBroadcaster::new(gateway.clone());
 
     // 2. Create a Self-Relay Transaction
-    let sender = address!("1111111111111111111111111111111111111111");
+    let sender = DUMMY_SENDER.to_string();
     let tx = FrameTransaction {
         chain_id: 1,
-        nonce_key: alloy::primitives::U256::ZERO,
-        nonce_seq: None, // Broadcaster will resolve this
-        sender: sender.to_string(),
+        nonce_keys: vec![alloy::primitives::U256::ZERO],
+        nonce_seq: Some(42), // Explicit sequence, broadcaster won't patch
+        sender: sender.clone(),
         max_priority_fee_per_gas: Some(10),
         max_fee_per_gas: Some(20),
+        max_fee_per_blob_gas: Some(alloy::primitives::U256::ZERO),
+        blob_versioned_hashes: vec![],
+        recent_root_references: vec![],
+        signatures: vec![],
         frames: vec![
             Frame {
                 mode: FrameMode::Verify,
-                flags: 0,
-                target: sender.to_string(), // Self-relay
-                gas_limit: 100000,
+                flags: 0x03,
+                target: Some(sender.clone()), // Self-relay
+                gas_limit: 50000,
                 value: "0".to_string(),
-                data: "0xsignature".to_string(),
+                data: "0xdeadbeef".to_string(), // stand-in signature blob (must be valid hex)
             },
             Frame {
                 mode: FrameMode::Sender,
                 flags: 0,
-                target: "0x2222222222222222222222222222222222222222".to_string(),
+                target: Some("0x2222222222222222222222222222222222222222".to_string()),
                 gas_limit: 50000,
                 value: "0".to_string(),
                 data: "0x".to_string(),
@@ -75,9 +58,12 @@ async fn test_self_relay_vertical_slice() {
     };
 
     // 3. Step 1: Compilation
-    let compiled_tx = compiler.compile_and_validate(tx).await.expect("Compilation failed");
-    assert_eq!(compiled_tx.sender, sender.to_string());
-    
+    let compiled_tx = compiler
+        .compile_and_validate(tx)
+        .await
+        .expect("Compilation failed");
+    assert_eq!(compiled_tx.sender, sender);
+
     // 4. Step 2: Queueing (Simulated by passing the Job)
     let job = queue::job::Job {
         id: "test-job".to_string(),
@@ -91,64 +77,72 @@ async fn test_self_relay_vertical_slice() {
 
     // 5. Step 3: Broadcasting
     let result = broadcaster.process(&borrowed_job).await;
-    
+
     assert!(result.is_ok(), "Broadcasting failed: {:?}", result.err());
     let tx_hash = result.unwrap();
-    
+
     // Verify the tx hash matches our mock
     assert_eq!(tx_hash, B256::repeat_byte(0xaa).to_string());
-    
+
     println!("Vertical slice successful! Tx Hash: {}", tx_hash);
 }
 
 #[tokio::test]
-async fn test_sponsor_vertical_slice() {
+async fn compiles_and_queues_sponsored_tx() {
     // 1. Setup
     let gateway = Arc::new(MockGateway {
         nonce: 100,
         gas_limit: 50000,
         tx_hash: B256::repeat_byte(0xbb),
     });
-    
+
     // The Compiler's key (acts as Paymaster sponsor)
-    let sponsor_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let sponsor_signer = Arc::new(InMemorySigner::new(sponsor_key).unwrap());
+    let sponsor_signer = Arc::new(InMemorySigner::new(SPONSOR_KEY).unwrap());
 
     let compiler = FrameCompiler::new(gateway.clone(), sponsor_signer.clone());
-    let broadcaster = MempoolBroadcaster::new(gateway.clone(), sponsor_signer.clone());
+    let broadcaster = MempoolBroadcaster::new(gateway.clone());
 
     // 2. Create a Sponsored Transaction
-    let sender = address!("1111111111111111111111111111111111111111");
-    let paymaster = address!("9999999999999999999999999999999999999999");
-    
+    let sender = DUMMY_SENDER.to_string();
+    let paymaster = "0x9999999999999999999999999999999999999999".to_string();
+
     let tx = FrameTransaction {
         chain_id: 1,
-        nonce_key: alloy::primitives::U256::ZERO,
-        nonce_seq: None,
-        sender: sender.to_string(),
+        nonce_keys: vec![alloy::primitives::U256::ZERO],
+        nonce_seq: Some(100),
+        sender: sender.clone(),
         max_priority_fee_per_gas: Some(10),
         max_fee_per_gas: Some(20),
+        max_fee_per_blob_gas: Some(alloy::primitives::U256::ZERO),
+        blob_versioned_hashes: vec![],
+        recent_root_references: vec![],
+        signatures: vec![FrameSignature {
+            scheme: 0, // SECP256K1
+            signer: paymaster.clone(),
+            msg: "".to_string(),
+            signature: "".to_string(), // Empty, compiler will fill this
+        }],
         frames: vec![
             Frame {
                 mode: FrameMode::Verify,
-                flags: 0,
-                target: sender.to_string(), // User's verify
-                gas_limit: 100000,
+                flags: 0x02,
+                target: Some(sender.clone()), // User's verify
+                gas_limit: 30000,
                 value: "0".to_string(),
-                data: "0xuser_sig".to_string(),
+                data: "0xabcdef01".to_string(), // stand-in user signature (must be valid hex)
             },
             Frame {
                 mode: FrameMode::Verify,
-                flags: 0,
-                target: paymaster.to_string(), // Sponsor's verify
-                gas_limit: 100000,
+                flags: 0x01,
+                target: Some(paymaster.clone()), // Sponsor's verify
+                gas_limit: 30000,
                 value: "0".to_string(),
                 data: "".to_string(), // Empty, compiler will fill this
             },
             Frame {
                 mode: FrameMode::Sender,
                 flags: 0,
-                target: "0x2222222222222222222222222222222222222222".to_string(),
+                target: Some("0x2222222222222222222222222222222222222222".to_string()),
                 gas_limit: 50000,
                 value: "0".to_string(),
                 data: "0x".to_string(),
@@ -157,12 +151,21 @@ async fn test_sponsor_vertical_slice() {
     };
 
     // 3. Step 1: Compilation (Injects signature)
-    let compiled_tx = compiler.compile_and_validate(tx).await.expect("Compilation failed");
-    
-    // Verify that the sponsor frame (index 1) now has a signature
-    assert!(!compiled_tx.frames[1].data.is_empty(), "Sponsor signature was not injected");
-    println!("Injected signature: {}", compiled_tx.frames[1].data);
-    
+    let compiled_tx = compiler
+        .compile_and_validate(tx)
+        .await
+        .expect("Compilation failed");
+
+    // Verify that the sponsor signature was injected
+    assert!(
+        !compiled_tx.signatures[0].signature.is_empty(),
+        "Sponsor signature was not filled"
+    );
+    println!(
+        "Injected signature: {}",
+        compiled_tx.signatures[0].signature
+    );
+
     // 4. Step 2: Queueing
     let job = queue::job::Job {
         id: "test-job-sponsored".to_string(),
@@ -176,10 +179,10 @@ async fn test_sponsor_vertical_slice() {
 
     // 5. Step 3: Broadcasting
     let result = broadcaster.process(&borrowed_job).await;
-    
+
     assert!(result.is_ok(), "Broadcasting failed: {:?}", result.err());
     let tx_hash = result.unwrap();
-    
+
     assert_eq!(tx_hash, B256::repeat_byte(0xbb).to_string());
-    println!("Sponsor vertical slice successful! Tx Hash: {}", tx_hash);
+    println!("Successfully compiled and queued sponsored tx! Tx Hash: {}", tx_hash);
 }

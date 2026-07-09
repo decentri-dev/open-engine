@@ -166,7 +166,7 @@ async fn cleanup_redis_keys(conn_manager: &ConnectionManager, queue_name: &str) 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_prune_race_condition_two_workers() {
+async fn prune_race_condition_two_workers() {
     // Initialize tracing
     let _ = tracing_subscriber::registry()
         .with(

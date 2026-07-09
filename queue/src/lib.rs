@@ -1,8 +1,8 @@
+mod completion;
 pub mod error;
 pub mod hooks;
 pub mod job;
 pub mod multilane;
-pub mod payload;
 pub mod queue;
 pub mod shutdown;
 
@@ -18,9 +18,7 @@ pub use job::{
     PushableJob, RequeuePosition,
 };
 pub use multilane::{MultilanePushableJob, MultilaneQueue};
-pub use payload::{Frame, FrameMode, FrameTransaction};
 use queue::QueueOptions;
-use redis::Pipeline;
 use redis::{aio::ConnectionManager, AsyncCommands};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
@@ -87,6 +85,33 @@ pub enum CancelResult {
     CancelledImmediately,
     CancellationPending,
     NotFound,
+}
+
+/// Result of a push: whether the job was newly created or suppressed as a
+/// duplicate of an already-known job id (same id already in the dedupe set).
+///
+/// The queue keys deduplication on the job id. Callers that key the id on a
+/// domain identity (e.g. `sender:nonce`) can use this to distinguish a genuinely
+/// new job from a re-submission, instead of silently reporting every push as
+/// accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushOutcome {
+    Created,
+    Duplicate,
+}
+
+/// Result of [`Queue::try_replace_pending_data`].
+///
+/// Replacement only ever swaps the stored job data for a job that is still
+/// waiting to run (pending or delayed). It refuses to touch a job that is
+/// actively being processed (`Active`) or has already finished (`Finished`),
+/// so a replacement can never race a live handler or resurrect a completed job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceOutcome {
+    Replaced,
+    NotFound,
+    Active,
+    Finished,
 }
 
 pub struct SuccessHookData<'a, O> {
@@ -277,10 +302,20 @@ impl<H: DurableExecution> Queue<H> {
         format!("queue:{}:job:{}:lease:{}", self.name, job_id, lease_token)
     }
 
+    /// Push a job, discarding whether it was newly created or a duplicate.
+    /// Prefer [`Queue::push_with_outcome`] when the caller needs to react to
+    /// a re-submission (e.g. to attempt a replacement).
     pub async fn push(
         &self,
         job_options: JobOptions<H::JobData>,
     ) -> Result<Job<H::JobData>, MessageQueueError> {
+        Ok(self.push_with_outcome(job_options).await?.0)
+    }
+
+    pub async fn push_with_outcome(
+        &self,
+        job_options: JobOptions<H::JobData>,
+    ) -> Result<(Job<H::JobData>, PushOutcome), MessageQueueError> {
         // Check for duplicates and handle job creation with deduplication
         let script = redis::Script::new(
             r#"
@@ -354,7 +389,7 @@ impl<H: DurableExecution> Queue<H> {
         let delay_secs = delay_to_queue_seconds(delay.delay);
         let position_string = delay.position.to_string();
 
-        let _result: (i32, String) = script
+        let (created, _id): (i32, String) = script
             .key(&self.name)
             .key(self.delayed_zset_name())
             .key(self.pending_list_name())
@@ -369,8 +404,75 @@ impl<H: DurableExecution> Queue<H> {
             .invoke_async(&mut self.redis.clone())
             .await?;
 
-        // Return job_id whether new or existing
-        Ok(job)
+        let outcome = if created == 1 {
+            PushOutcome::Created
+        } else {
+            PushOutcome::Duplicate
+        };
+
+        Ok((job, outcome))
+    }
+
+    /// Atomically replace the stored data of a job that is still waiting to run.
+    ///
+    /// This is the replacement primitive behind fee-bump semantics: a caller
+    /// that keys the job id on `sender:nonce` can swap the queued transaction
+    /// for a re-signed, higher-fee one at the same nonce. The swap only applies
+    /// while the job is pending or delayed (not yet popped); it refuses when the
+    /// job is `Active` (a handler already holds a copy mid-broadcast) or
+    /// `Finished` (already succeeded/failed), so it can neither race a live
+    /// broadcast nor resurrect a completed job. The domain-level decision of
+    /// whether the new data is a valid replacement (e.g. the fee bump rule)
+    /// belongs to the caller — this method only performs the guarded swap.
+    pub async fn try_replace_pending_data(
+        &self,
+        job_id: &str,
+        new_data: &H::JobData,
+    ) -> Result<ReplaceOutcome, MessageQueueError> {
+        let data_json = serde_json::to_string(new_data)?;
+
+        let script = redis::Script::new(
+            r#"
+            local job_id = ARGV[1]
+            local new_data = ARGV[2]
+
+            local job_data_hash = KEYS[1]
+            local active_hash = KEYS[2]
+            local job_meta_hash = KEYS[3]
+
+            if redis.call('HEXISTS', job_data_hash, job_id) == 0 then
+                return 'not_found'
+            end
+            -- A handler already popped this job and holds its own copy; swapping
+            -- the stored data now would race the live broadcast.
+            if redis.call('HEXISTS', active_hash, job_id) == 1 then
+                return 'active'
+            end
+            -- Job already reached a terminal state; do not resurrect it.
+            if redis.call('HEXISTS', job_meta_hash, 'finished_at') == 1 then
+                return 'finished'
+            end
+
+            redis.call('HSET', job_data_hash, job_id, new_data)
+            return 'replaced'
+            "#,
+        );
+
+        let result: String = script
+            .key(self.job_data_hash_name())
+            .key(self.active_hash_name())
+            .key(self.job_meta_hash_name(job_id))
+            .arg(job_id)
+            .arg(data_json)
+            .invoke_async(&mut self.redis.clone())
+            .await?;
+
+        Ok(match result.as_str() {
+            "replaced" => ReplaceOutcome::Replaced,
+            "active" => ReplaceOutcome::Active,
+            "finished" => ReplaceOutcome::Finished,
+            _ => ReplaceOutcome::NotFound,
+        })
     }
 
     pub async fn get_job(
@@ -967,38 +1069,21 @@ impl<H: DurableExecution> Queue<H> {
         }
     }
 
-    fn add_success_operations(
-        &self,
-        job: &BorrowedJob<H::JobData>,
-        result: &H::Output,
-        pipeline: &mut Pipeline,
-    ) -> Result<(), MessageQueueError> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let lease_key = self.lease_key_name(&job.job.id, &job.lease_token);
-
-        // Delete the lease key to consume it
-        pipeline.del(&lease_key);
-
-        // Add job completion operations
-        pipeline
-            .hdel(self.active_hash_name(), &job.job.id)
-            .lpush(self.success_list_name(), &job.job.id)
-            .hset(self.job_meta_hash_name(&job.job.id), "finished_at", now)
-            .hdel(self.job_meta_hash_name(&job.job.id), "lease_token");
-
-        let result_json = serde_json::to_string(result)?;
-        pipeline.hset(self.job_result_hash_name(), &job.job.id, result_json);
-
-        // For "active" idempotency mode, remove from deduplication set immediately
-        if self.options.idempotency_mode == queue::IdempotencyMode::Active {
-            pipeline.srem(self.dedupe_set_name(), &job.job.id);
+    /// Resolve the Redis keys a completion touches for this (flat-keyed) queue.
+    fn completion_keys(&self, job_id: &str, lease_token: &str) -> completion::CompletionKeys {
+        completion::CompletionKeys {
+            lease_key: self.lease_key_name(job_id, lease_token),
+            active_hash: self.active_hash_name(),
+            pending_list: self.pending_list_name(),
+            delayed_zset: self.delayed_zset_name(),
+            success_list: self.success_list_name(),
+            failed_list: self.failed_list_name(),
+            job_result_hash: self.job_result_hash_name(),
+            job_meta_hash: self.job_meta_hash_name(job_id),
+            job_errors_list: self.job_errors_list_name(job_id),
+            dedupe_set: self.dedupe_set_name(),
+            idempotency_mode: self.options.idempotency_mode.clone(),
         }
-
-        Ok(())
     }
 
     async fn post_success_completion(&self) -> Result<(), MessageQueueError> {
@@ -1072,111 +1157,6 @@ impl<H: DurableExecution> Queue<H> {
                 queue = self.name(),
                 "Pruning ran but deleted 0 jobs (all were protected or none eligible)"
             );
-        }
-
-        Ok(())
-    }
-
-    fn add_nack_operations(
-        &self,
-        job: &BorrowedJob<H::JobData>,
-        error: &H::ErrorData,
-        delay: Option<Duration>,
-        position: RequeuePosition,
-        pipeline: &mut Pipeline,
-    ) -> Result<(), MessageQueueError> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let lease_key = self.lease_key_name(&job.job.id, &job.lease_token);
-
-        // Delete the lease key to consume it
-        pipeline.del(&lease_key);
-
-        // Remove from active and clear lease token
-        pipeline
-            .hdel(self.active_hash_name(), &job.job.id)
-            .hdel(self.job_meta_hash_name(&job.job.id), "lease_token");
-
-        let error_record = JobErrorRecord {
-            attempt: job.job.attempts,
-            error,
-            details: JobErrorType::nack(delay, position),
-            created_at: now,
-        };
-
-        let error_json = serde_json::to_string(&error_record)?;
-        pipeline.lpush(self.job_errors_list_name(&job.job.id), error_json);
-
-        // Add to proper queue based on delay and position
-        if let Some(delay_duration) = delay {
-            let delay_until = now + delay_to_queue_seconds(delay_duration);
-            let pos_str = position.to_string();
-
-            pipeline
-                .hset(
-                    self.job_meta_hash_name(&job.job.id),
-                    "reentry_position",
-                    pos_str,
-                )
-                .zadd(self.delayed_zset_name(), &job.job.id, delay_until);
-        } else {
-            match position {
-                RequeuePosition::First => {
-                    pipeline.lpush(self.pending_list_name(), &job.job.id);
-                }
-                RequeuePosition::Last => {
-                    pipeline.rpush(self.pending_list_name(), &job.job.id);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn post_nack_completion(&self) -> Result<(), MessageQueueError> {
-        // No pruning needed for nack
-        Ok(())
-    }
-
-    fn add_fail_operations(
-        &self,
-        job: &BorrowedJob<H::JobData>,
-        error: &H::ErrorData,
-        pipeline: &mut Pipeline,
-    ) -> Result<(), MessageQueueError> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let lease_key = self.lease_key_name(&job.job.id, &job.lease_token);
-
-        // Delete the lease key to consume it
-        pipeline.del(&lease_key);
-
-        // Remove from active, add to failed, clear lease token
-        pipeline
-            .hdel(self.active_hash_name(), &job.job.id)
-            .lpush(self.failed_list_name(), &job.job.id)
-            .hset(self.job_meta_hash_name(&job.job.id), "finished_at", now)
-            .hdel(self.job_meta_hash_name(&job.job.id), "lease_token");
-
-        // Store error
-        let error_record = JobErrorRecord {
-            attempt: job.job.attempts,
-            error,
-            details: JobErrorType::fail(),
-            created_at: now,
-        };
-        let error_json = serde_json::to_string(&error_record)?;
-        pipeline.lpush(self.job_errors_list_name(&job.job.id), error_json);
-
-        // For "active" idempotency mode, remove from deduplication set immediately
-        if self.options.idempotency_mode == queue::IdempotencyMode::Active {
-            pipeline.srem(self.dedupe_set_name(), &job.job.id);
         }
 
         Ok(())
@@ -1260,97 +1240,22 @@ impl<H: DurableExecution> Queue<H> {
         job: &BorrowedJob<H::JobData>,
         result: JobResult<H::Output, H::ErrorData>,
     ) -> Result<(), MessageQueueError> {
-        // 1. Run hook once and build pipeline with all operations
-        let mut hook_pipeline = redis::pipe();
-        let mut tx_context = TransactionContext::new(&mut hook_pipeline, self.name().to_string());
-
-        match &result {
-            Ok(output) => {
-                let success_hook_data = SuccessHookData { result: output };
-                self.handler
-                    .on_success(job, success_hook_data, &mut tx_context)
-                    .await;
-                self.add_success_operations(job, output, &mut hook_pipeline)?;
-            }
-            Err(JobError::Nack {
-                error,
-                delay,
-                position,
-            }) => {
-                let nack_hook_data = NackHookData {
-                    error,
-                    delay: *delay,
-                    position: *position,
-                };
-                self.handler
-                    .on_nack(job, nack_hook_data, &mut tx_context)
-                    .await;
-                self.add_nack_operations(job, error, *delay, *position, &mut hook_pipeline)?;
-            }
-            Err(JobError::Fail(error)) => {
-                let fail_hook_data = FailHookData { error };
-                self.handler
-                    .on_fail(job, fail_hook_data, &mut tx_context)
-                    .await;
-                self.add_fail_operations(job, error, &mut hook_pipeline)?;
-            }
-        }
-
-        // 2. Now use this pipeline in unlimited retry loop with lease check
-        let lease_key = self.lease_key_name(&job.job.id, &job.lease_token);
-
-        loop {
-            let mut conn = self.redis.clone();
-
-            // WATCH the lease key
-            redis::cmd("WATCH")
-                .arg(&lease_key)
-                .query_async::<_, ()>(&mut conn)
+        let keys = self.completion_keys(&job.job.id, &job.lease_token);
+        let committed =
+            completion::complete(&*self.handler, &self.redis, self.name(), &keys, job, &result)
                 .await?;
 
-            // Check if lease exists - if not, job was cancelled or timed out
-            let lease_exists: bool = conn.exists(&lease_key).await?;
-            if !lease_exists {
-                redis::cmd("UNWATCH")
-                    .query_async::<_, ()>(&mut conn)
-                    .await?;
-                tracing::warn!(
-                    job_id = job.job.id,
-                    "Lease no longer exists, job was cancelled or timed out"
-                );
-                return Ok(());
-            }
-
-            // Clone the pipeline and make it atomic for this attempt
-            let mut atomic_pipeline = hook_pipeline.clone();
-            atomic_pipeline.atomic();
-
-            // Execute atomically with WATCH/MULTI/EXEC
-            match atomic_pipeline
-                .query_async::<_, Vec<redis::Value>>(&mut conn)
-                .await
-            {
-                Ok(_) => {
-                    // Success! Now run post-completion methods
-                    match &result {
-                        Ok(_) => self.post_success_completion().await?,
-                        Err(JobError::Nack { .. }) => self.post_nack_completion().await?,
-                        Err(JobError::Fail(_)) => self.post_fail_completion().await?,
-                    }
-
-                    tracing::debug!(job_id = job.job.id, "Job completion successful");
-                    return Ok(());
-                }
-                Err(_) => {
-                    // WATCH failed (lease key changed), retry
-                    tracing::debug!(
-                        job_id = job.job.id,
-                        "WATCH failed during completion, retrying"
-                    );
-                    continue;
-                }
+        // Post-completion pruning only runs if the transition actually committed
+        // (i.e. the lease was still held). Nack/Defer have nothing to prune.
+        if committed {
+            match &result {
+                Ok(_) => self.post_success_completion().await?,
+                Err(JobError::Fail(_)) => self.post_fail_completion().await?,
+                Err(JobError::Nack { .. }) | Err(JobError::Defer { .. }) => {}
             }
         }
+
+        Ok(())
     }
 
     // Special completion method for queue errors (deserialization failures) with lease token

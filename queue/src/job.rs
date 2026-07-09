@@ -50,6 +50,18 @@ pub enum JobError<E> {
         position: RequeuePosition,
     },
     Fail(E),
+    /// Reschedule the job without recording a failure.
+    ///
+    /// Unlike [`JobError::Nack`], a `Defer` is not an error: the job did not
+    /// fail, it is waiting for an external precondition to become true (e.g. a
+    /// predecessor nonce to land on-chain). Completing a job with `Defer` writes
+    /// no error record and does not count as a processing attempt — only the
+    /// requeue happens. Use it for benign "not yet, check again shortly" holds so
+    /// the error list and attempt counter keep reflecting genuine failures.
+    Defer {
+        delay: Duration,
+        position: RequeuePosition,
+    },
 }
 
 pub trait ToJobResult<T, E> {

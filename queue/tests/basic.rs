@@ -36,11 +36,11 @@ async fn cleanup_redis_keys(conn_manager: &ConnectionManager, queue_name: &str) 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_queue_push_and_process_job() {
+async fn queue_push_and_process_job() {
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             // Default to info level if RUST_LOG environment variable is not set
-            "thirdweb_engine=debug,tower_http=debug,axum=debug".into()
+            "engine=debug,tower_http=debug,axum=debug".into()
         }))
         .with(tracing_subscriber::fmt::layer())
         .init();

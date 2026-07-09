@@ -160,11 +160,11 @@ impl DurableExecution for RetryJobHandler {
 type RetryJobQueue = Queue<RetryJobHandler>;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_job_retry_attempts() {
+async fn job_retry_attempts() {
     tracing_subscriber::registry()
         .with(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "thirdweb_engine=debug,tower_http=debug,axum=debug".into()),
+                .unwrap_or_else(|_| "engine=debug,tower_http=debug,axum=debug".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -287,7 +287,7 @@ async fn test_job_retry_attempts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_different_retry_counts() {
+async fn different_retry_counts() {
     // Test multiple different retry counts to ensure it works consistently
     let test_cases = vec![1, 2, 3, 5, 7];
 

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use redis::{aio::ConnectionManager, AsyncCommands, Pipeline};
+use redis::{aio::ConnectionManager, AsyncCommands};
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tracing::Instrument;
@@ -18,8 +18,7 @@ use crate::{
     lua_json_array,
     queue::QueueOptions,
     shutdown::WorkerHandle,
-    CancelResult, DurableExecution, FailHookData, NackHookData, QueueInternalErrorHookData,
-    SuccessHookData, UserCancellable,
+    CancelResult, DurableExecution, FailHookData, QueueInternalErrorHookData, UserCancellable,
 };
 
 /// A multilane queue that provides fair load balancing across multiple lanes
@@ -932,40 +931,27 @@ impl<H: DurableExecution> MultilaneQueue<H> {
     }
 
     // Job completion methods (same as single-lane queue but with multilane naming)
-    fn add_success_operations(
+    /// Resolve the Redis keys a completion touches for a job in `lane_id`. The
+    /// `active`/`pending`/`delayed` keys are lane-scoped; the rest are queue-wide.
+    fn completion_keys(
         &self,
-        job: &BorrowedJob<H::JobData>,
-        result: &H::Output,
-        pipeline: &mut Pipeline,
-    ) -> Result<(), MessageQueueError> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let lease_key = self.lease_key_name(&job.job.id, &job.lease_token);
-
-        pipeline.del(&lease_key);
-
-        // Get lane_id from job metadata to remove from correct lane active hash
-        let job_meta_hash = self.job_meta_hash_name(&job.job.id);
-
-        // We need to get lane_id first, then remove from that lane's active hash
-        // This requires a separate Redis call before the pipeline, but ensures atomicity within the pipeline
-        pipeline
-            .lpush(self.success_list_name(), &job.job.id)
-            .hset(&job_meta_hash, "finished_at", now)
-            .hdel(&job_meta_hash, "lease_token");
-
-        let result_json = serde_json::to_string(result)?;
-        pipeline.hset(self.job_result_hash_name(), &job.job.id, result_json);
-
-        // For "active" idempotency mode, remove from deduplication set immediately
-        if self.options.idempotency_mode == crate::queue::IdempotencyMode::Active {
-            pipeline.srem(self.dedupe_set_name(), &job.job.id);
+        job_id: &str,
+        lease_token: &str,
+        lane_id: &str,
+    ) -> crate::completion::CompletionKeys {
+        crate::completion::CompletionKeys {
+            lease_key: self.lease_key_name(job_id, lease_token),
+            active_hash: self.lane_active_hash_name(lane_id),
+            pending_list: self.lane_pending_list_name(lane_id),
+            delayed_zset: self.lane_delayed_zset_name(lane_id),
+            success_list: self.success_list_name(),
+            failed_list: self.failed_list_name(),
+            job_result_hash: self.job_result_hash_name(),
+            job_meta_hash: self.job_meta_hash_name(job_id),
+            job_errors_list: self.job_errors_list_name(job_id),
+            dedupe_set: self.dedupe_set_name(),
+            idempotency_mode: self.options.idempotency_mode.clone(),
         }
-
-        Ok(())
     }
 
     async fn post_success_completion(&self) -> Result<(), MessageQueueError> {
@@ -1037,82 +1023,6 @@ impl<H: DurableExecution> MultilaneQueue<H> {
 
         if trimmed_count > 0 {
             tracing::info!("Pruned {} successful jobs", trimmed_count);
-        }
-
-        Ok(())
-    }
-
-    fn add_nack_operations(
-        &self,
-        job: &BorrowedJob<H::JobData>,
-        error: &H::ErrorData,
-        delay: Option<Duration>,
-        position: RequeuePosition,
-        pipeline: &mut Pipeline,
-    ) -> Result<(), MessageQueueError> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let lease_key = self.lease_key_name(&job.job.id, &job.lease_token);
-        let job_meta_hash = self.job_meta_hash_name(&job.job.id);
-
-        pipeline.del(&lease_key);
-        pipeline.hdel(&job_meta_hash, "lease_token");
-
-        let error_record = JobErrorRecord {
-            attempt: job.job.attempts,
-            error,
-            details: JobErrorType::nack(delay, position),
-            created_at: now,
-        };
-
-        let error_json = serde_json::to_string(&error_record)?;
-        pipeline.lpush(self.job_errors_list_name(&job.job.id), error_json);
-
-        // Note: The actual requeuing logic needs to be handled by a separate operation
-        // since we need the lane_id from metadata. This will be done in the complete_job method.
-
-        Ok(())
-    }
-
-    async fn post_nack_completion(&self) -> Result<(), MessageQueueError> {
-        Ok(())
-    }
-
-    fn add_fail_operations(
-        &self,
-        job: &BorrowedJob<H::JobData>,
-        error: &H::ErrorData,
-        pipeline: &mut Pipeline,
-    ) -> Result<(), MessageQueueError> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let lease_key = self.lease_key_name(&job.job.id, &job.lease_token);
-        let job_meta_hash = self.job_meta_hash_name(&job.job.id);
-
-        pipeline.del(&lease_key);
-        pipeline
-            .lpush(self.failed_list_name(), &job.job.id)
-            .hset(&job_meta_hash, "finished_at", now)
-            .hdel(&job_meta_hash, "lease_token");
-
-        let error_record = JobErrorRecord {
-            attempt: job.job.attempts,
-            error,
-            details: JobErrorType::fail(),
-            created_at: now,
-        };
-        let error_json = serde_json::to_string(&error_record)?;
-        pipeline.lpush(self.job_errors_list_name(&job.job.id), error_json);
-
-        // For "active" idempotency mode, remove from deduplication set immediately
-        if self.options.idempotency_mode == crate::queue::IdempotencyMode::Active {
-            pipeline.srem(self.dedupe_set_name(), &job.job.id);
         }
 
         Ok(())
@@ -1193,143 +1103,40 @@ impl<H: DurableExecution> MultilaneQueue<H> {
         job: &BorrowedJob<H::JobData>,
         result: JobResult<H::Output, H::ErrorData>,
     ) -> Result<(), MessageQueueError> {
-        // First, we need to get the lane_id and remove from appropriate lane's active hash
-        let mut conn = self.redis.clone();
-        let lane_id: Option<String> = conn
+        // Completion for the multilane queue is identical to the single-lane
+        // queue except the requeue targets are lane-scoped, so resolve the job's
+        // lane and hand off to the shared completion core.
+        let lane_id: Option<String> = self
+            .redis
+            .clone()
             .hget(self.job_meta_hash_name(&job.job.id), "lane_id")
             .await?;
-
         let lane_id = lane_id.ok_or_else(|| MessageQueueError::Runtime {
             message: format!("Job {} missing lane_id in metadata", job.job.id),
         })?;
 
-        // Build pipeline with hooks and operations
-        let mut hook_pipeline = redis::pipe();
-        let mut tx_context =
-            TransactionContext::new(&mut hook_pipeline, self.queue_id().to_string());
+        let keys = self.completion_keys(&job.job.id, &job.lease_token, &lane_id);
+        let committed = crate::completion::complete(
+            &*self.handler,
+            &self.redis,
+            self.queue_id(),
+            &keys,
+            job,
+            &result,
+        )
+        .await?;
 
-        match &result {
-            Ok(output) => {
-                let success_hook_data = SuccessHookData { result: output };
-                self.handler
-                    .on_success(job, success_hook_data, &mut tx_context)
-                    .await;
-                self.add_success_operations(job, output, &mut hook_pipeline)?;
-                // Remove from lane's active hash
-                hook_pipeline.hdel(self.lane_active_hash_name(&lane_id), &job.job.id);
-            }
-            Err(JobError::Nack {
-                error,
-                delay,
-                position,
-            }) => {
-                let nack_hook_data = NackHookData {
-                    error,
-                    delay: *delay,
-                    position: *position,
-                };
-                self.handler
-                    .on_nack(job, nack_hook_data, &mut tx_context)
-                    .await;
-                self.add_nack_operations(job, error, *delay, *position, &mut hook_pipeline)?;
-
-                // Remove from lane's active hash and requeue to appropriate lane queue
-                hook_pipeline.hdel(self.lane_active_hash_name(&lane_id), &job.job.id);
-
-                if let Some(delay_duration) = delay {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                    let delay_until = now + delay_to_queue_seconds(*delay_duration);
-                    let pos_str = position.to_string();
-
-                    hook_pipeline
-                        .hset(
-                            self.job_meta_hash_name(&job.job.id),
-                            "reentry_position",
-                            pos_str,
-                        )
-                        .zadd(
-                            self.lane_delayed_zset_name(&lane_id),
-                            &job.job.id,
-                            delay_until,
-                        );
-                } else {
-                    match position {
-                        RequeuePosition::First => {
-                            hook_pipeline.lpush(self.lane_pending_list_name(&lane_id), &job.job.id);
-                        }
-                        RequeuePosition::Last => {
-                            hook_pipeline.rpush(self.lane_pending_list_name(&lane_id), &job.job.id);
-                        }
-                    }
-                }
-            }
-            Err(JobError::Fail(error)) => {
-                let fail_hook_data = FailHookData { error };
-                self.handler
-                    .on_fail(job, fail_hook_data, &mut tx_context)
-                    .await;
-                self.add_fail_operations(job, error, &mut hook_pipeline)?;
-                // Remove from lane's active hash
-                hook_pipeline.hdel(self.lane_active_hash_name(&lane_id), &job.job.id);
+        // Post-completion pruning only runs if the transition actually committed
+        // (i.e. the lease was still held). Nack/Defer have nothing to prune.
+        if committed {
+            match &result {
+                Ok(_) => self.post_success_completion().await?,
+                Err(JobError::Fail(_)) => self.post_fail_completion().await?,
+                Err(JobError::Nack { .. }) | Err(JobError::Defer { .. }) => {}
             }
         }
 
-        // Execute with lease protection (same pattern as single-lane queue)
-        let lease_key = self.lease_key_name(&job.job.id, &job.lease_token);
-
-        loop {
-            let mut conn = self.redis.clone();
-
-            redis::cmd("WATCH")
-                .arg(&lease_key)
-                .query_async::<_, ()>(&mut conn)
-                .await?;
-
-            let lease_exists: bool = conn.exists(&lease_key).await?;
-            if !lease_exists {
-                redis::cmd("UNWATCH")
-                    .query_async::<_, ()>(&mut conn)
-                    .await?;
-                tracing::warn!(
-                    job_id = job.job.id,
-                    "Lease no longer exists, job was cancelled or timed out"
-                );
-                return Ok(());
-            }
-
-            let mut atomic_pipeline = hook_pipeline.clone();
-            atomic_pipeline.atomic();
-
-            match atomic_pipeline
-                .query_async::<_, Vec<redis::Value>>(&mut conn)
-                .await
-            {
-                Ok(_) => {
-                    match &result {
-                        Ok(_) => self.post_success_completion().await?,
-                        Err(JobError::Nack { .. }) => self.post_nack_completion().await?,
-                        Err(JobError::Fail(_)) => self.post_fail_completion().await?,
-                    }
-
-                    tracing::debug!(
-                        job_id = job.job.id,
-                        lane_id = lane_id,
-                        "Job completion successful"
-                    );
-                    return Ok(());
-                }
-                Err(_) => {
-                    tracing::debug!(
-                        job_id = job.job.id,
-                        "WATCH failed during completion, retrying"
-                    );
-                    continue;
-                }
-            }
-        }
+        Ok(())
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(job_id = job.id, queue = self.queue_id()))]

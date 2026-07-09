@@ -105,7 +105,7 @@ impl DurableExecution for DelayTestJobHandler {
 type DelayTestQueue = Queue<DelayTestJobHandler>;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_job_delay_basic() {
+async fn job_delay_basic() {
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "queue=debug".into()))
         .with(tracing_subscriber::fmt::layer())
@@ -288,7 +288,7 @@ async fn test_job_delay_basic() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_delay_position_ordering() {
+async fn delay_position_ordering() {
     // Test that delayed jobs respect RequeuePosition when they expire
 
     let test_id = nanoid::nanoid!();

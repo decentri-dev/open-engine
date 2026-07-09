@@ -1,11 +1,44 @@
 use queue::error::MessageQueueError;
-use queue::job::{BorrowedJob, PushableJob};
-use queue::redis;
+use queue::job::{BorrowedJob};
 use queue::Queue;
-use queue::{queue::QueueOptions, DurableExecution, Frame, FrameMode, FrameTransaction, JobResult};
+use queue::{DurableExecution, JobResult};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::time::Duration;
+
+// Local stand-in payload. The queue is generic over its job data — the real
+// frame-transaction domain type lives in `open_engine_core::domain` and the
+// queue crate must not carry its own copy (an earlier duplicate drifted out
+// of sync with the wire format).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FrameMode {
+    Verify,
+    Sender,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Frame {
+    pub mode: FrameMode,
+    pub flags: u8,
+    pub target: String,
+    pub gas_limit: u64,
+    pub value: String,
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameTransaction {
+    pub chain_id: u64,
+    pub nonce: Option<u64>,
+    pub sender: String,
+    pub max_priority_fee_per_gas: Option<u128>,
+    pub max_fee_per_gas: Option<u128>,
+    pub max_fee_per_blob_gas: Option<String>,
+    pub blob_versioned_hashes: Vec<String>,
+    pub frames: Vec<Frame>,
+    #[serde(default)]
+    pub signatures: Vec<String>,
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct TestErrorData(pub String);
@@ -43,7 +76,7 @@ impl DurableExecution for TestFrameTransactionExecutor {
 
 #[tokio::test]
 #[ignore = "requires redis"]
-async fn test_frame_transaction_queue() {
+async fn frame_transaction_queue() {
     let redis_url = "redis://127.0.0.1:6379/";
 
     // Create the executor
@@ -63,6 +96,9 @@ async fn test_frame_transaction_queue() {
         sender: "0xAlice".to_string(),
         max_priority_fee_per_gas: Some(100),
         max_fee_per_gas: Some(200),
+        max_fee_per_blob_gas: Some("0".to_string()),
+        blob_versioned_hashes: vec![],
+        signatures: vec![],
         frames: vec![
             Frame {
                 mode: FrameMode::Verify,

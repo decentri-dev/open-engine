@@ -14,7 +14,7 @@ open_engine_core = { path = "../core" }
 compiler = { path = "../compiler" }
 queue = { path = "../queue" }
 broadcaster = { path = "../broadcaster" }
-alloy = { version = "0.1.3", features = ["serde", "signers", "rpc", "transports"] }
+alloy = { version = "2.0.4", features = ["serde", "signers", "rpc", "transports"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

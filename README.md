@@ -4,17 +4,19 @@ The Rust-based transaction handling engine, built from scratch as an additive re
 
 ## Architecture & Modules
 
-The `open-engine` workspace is composed of three primary modules operating synchronously through a Redis-backed State Machine:
+The `open-engine` workspace is composed of five primary modules operating synchronously through a Redis-backed State Machine:
 
-1. **`api`**: The ingress layer built with Axum. It receives abstract user intents, performs initial validation via a dedicated **Compiler**, and queues them. 
-2. **`queue`**: The Redis-backed State Machine layer. It acts as the concurrency and storage layer used exclusively by the engine to track nonces, queue states, and manage crash-recovery logs.
-3. **`broadcaster`**: The component that reads from the queue, sequences nonces, recalculates/bumps gas, and submits the finalized EIP-8141 Frame Transactions to the network. It intelligently routes transactions to the public mempool or private channels (Expansive Tier).
+1. **`api`**: The ingress layer built with Axum. It receives strictly structured EIP-8141 Frame Transaction payloads, passes them through the **Compiler**, and queues them. It also initializes and hosts the background worker loop.
+2. **`compiler`**: The validation and enhancement layer. It enforces EIP-8141 frame structure, injects Canonical Paymaster signatures when sponsorship is requested, and preflights the transaction through the chain gateway using the node's frame-aware `ethrex_simulateFrameTransaction` RPC.
+3. **`queue`**: The Redis-backed State Machine layer. It acts as the concurrency and storage layer used exclusively by the engine to track queue states, retries, idempotency, leases, and crash-recovery logs.
+4. **`broadcaster`**: The component that receives jobs from the queue, reconciles the on-chain nonce, encodes the finalized EIP-8141 Frame Transaction, and submits it to the network.
+5. **`core`** (crate: `open_engine_core`): Shared domain, encoding, signer, and chain gateway primitives used by the API, Compiler, and Broadcaster.
 
-### Cross-Module Lifecyle
+### Cross-Module Lifecycle
 
-1. **Intake**: User intents arrive at the `api`.
-2. **Compilation & Enqueue**: The Compiler translates intents into strictly formatted EIP-8141 Frame sequences (ensuring `VERIFY` proceeds `SENDER` frames) and stores abstract structs in the `queue`.
-3. **Broadcast & Sequencing**: The `broadcaster` pulls transactions from the `queue`, finalizes gas and nonces, compiles them into bytes, and routes them to a mempool (via Canonical Paymaster bypasses or Expansive Tier channels). 
+1. **Intake**: Strict Frame Transaction payloads arrive at the `api`.
+2. **Compilation & Enqueue**: The Compiler validates the EIP-8141 frame sequence, injects sponsorship data when needed, simulates the fully signed transaction (`ethrex_simulateFrameTransaction`, skipped for future-sequence transactions the broadcaster will hold), and stores the abstract transaction struct in the `queue`.
+3. **Broadcast & Sequencing**: The `broadcaster` pulls transactions from the `queue`, reconciles the sender nonce, encodes them into bytes, and submits them to the mempool through the chain gateway.
 
 ## Getting started
 
@@ -32,13 +34,55 @@ The `open-engine` workspace is composed of three primary modules operating synch
    docker run -d --name open-engine-redis -p 6379:6379 redis
    ```
 
-2. **Run the API / Broadcaster**:
-   You can run the modules using Cargo. Typically, starting up the API or Broadcaster will connect to the local Redis instance:
+2. **Run the API**:
+   Starting the API initializes the Compiler, Queue, Broadcaster, and queue worker. It connects to Redis and expects an RPC endpoint plus sponsor key:
    ```bash
+   export RPC_URL=http://localhost:8545
+   export SPONSOR_KEY=<hex-encoded-sponsor-key>
    cargo run -p api
-   # In a separate terminal
-   cargo run -p broadcaster
    ```
+
+   The `MAX_VERIFY_GAS` admission budget is a fixed constant that mirrors the
+   network's mempool policy (see `open_engine_core::domain::MAX_VERIFY_GAS`);
+   it is deliberately not configurable per instance.
+
+### Submitting a Frame Transaction via cURL
+
+You can submit an EIP-8141 frame transaction using this `curl` command:
+
+```bash
+curl -X POST http://localhost:3001/transaction \
+     -H "Content-Type: application/json" \
+     -d '{
+  "chain_id": 1,
+  "nonce_keys": [0],
+  "nonce_seq": 42,
+  "sender": "0x1111111111111111111111111111111111111111",
+  "max_priority_fee_per_gas": 10,
+  "max_fee_per_gas": 20,
+  "max_fee_per_blob_gas": "0x0",
+  "blob_versioned_hashes": [],
+  "signatures": [],
+  "frames": [
+    {
+      "mode": "Verify",
+      "flags": 3,
+      "target": "0x1111111111111111111111111111111111111111",
+      "gas_limit": 50000,
+      "value": "0",
+      "data": "0x"
+    },
+    {
+      "mode": "Sender",
+      "flags": 0,
+      "target": "0x2222222222222222222222222222222222222222",
+      "gas_limit": 50000,
+      "value": "0",
+      "data": "0x"
+    }
+  ]
+}'
+```
 
 ## Running Tests
 
@@ -53,7 +97,7 @@ We use Rust's native test framework for unit and integration testing.
   cargo test -p queue
   ```
 - **Run benchmarks**:
-  We use `criterion` for benchmarking queue performance and compilation. Run it using:
+  We use `criterion` for benchmarking queue performance. Run it using:
   ```bash
   cargo bench -p queue
   ```
@@ -61,6 +105,7 @@ We use Rust's native test framework for unit and integration testing.
 ## Domain Specifics
 
 When modifying the engine, please refer to our internal terminology in `CONTEXT.md`.
-- **Frame Transaction**: Native EIP-8141 transaction (Type `0x06`). Avoid terms like *UserOp*.
-- **Compiler**: Modifies and packages frames. Avoid terms like *Builder*.
-- **Canonical Paymaster**: Recognized instantly by the mempool via bytecode comparison. Non-Canonical paymasters operate under severe limits (1 pending transaction network-wide).
+- **Frame Transaction**: Native EIP-8141 transaction (Type `0x06`).
+- **Compiler**: Modifies and packages frames.
+- **Canonical Paymaster**: A paymaster instance is **canonical** iff the runtime code at the `pay` frame target exactly matches the canonical paymaster implementation (`sources/EIP-8141/EIP-8141.md:711`). Canonical paymasters bypass the generic validation trace/opcode rules and instead use **paymaster-specific accounting and reservation rules** (`sources/EIP-8141/EIP-8141.md:715`).
+- **Non-Canonical Paymaster**: Any paymaster whose runtime code does not exactly match the canonical implementation. In the public mempool, the latest spec limits this by pending transactions **in the mempool using this paymaster**, with `MAX_PENDING_TXS_USING_NON_CANONICAL_PAYMASTER = 1` (`sources/EIP-8141/EIP-8141.md:543`, `sources/EIP-8141/EIP-8141.md:743`).

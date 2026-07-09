@@ -128,7 +128,7 @@ impl DurableExecution for SleepForeverHandler {
 type SleepForeverQueue = Queue<SleepForeverHandler>;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_job_lease_expiry() {
+async fn job_lease_expiry() {
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "queue=debug".into()))
         .with(tracing_subscriber::fmt::layer())
@@ -283,7 +283,7 @@ async fn test_job_lease_expiry() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_multiple_job_lease_expiry() {
+async fn multiple_job_lease_expiry() {
     // Test that multiple jobs can have their leases expire independently
 
     let queue_name = format!("test_multi_lease_{}", nanoid::nanoid!(6));

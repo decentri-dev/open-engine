@@ -1,4 +1,40 @@
+use alloy::primitives::{B256, U256};
 use serde::{Deserialize, Serialize};
+
+pub const FRAME_TX_INTRINSIC_COST: u64 = 15000;
+pub const FRAME_TX_PER_FRAME_COST: u64 = 475;
+
+/// EIP-8141 `MAX_VERIFY_GAS`: the gas budget for a frame transaction's
+/// validation prefix. This bounds mempool admission only — it is not enforced
+/// in block execution or consensus, so it can move without touching the state
+/// transition.
+///
+/// The spec's canonical value is 100_000, but the network we broadcast to
+/// currently admits up to 500_000 so a validation prefix can run a heavier
+/// proof-verification VERIFY frame while the real envelope and signature
+/// overhead is being benchmarked. We mirror the admission budget: a stricter
+/// local value would reject transactions the node accepts, a looser one would
+/// queue transactions the node rejects. Revisit when the canonical value
+/// settles.
+pub const MAX_VERIFY_GAS: u64 = 500_000;
+pub const FRAME_TX_MAX_FRAMES: usize = 64;
+pub const EXPIRY_VERIFIER_ADDRESS: &str = "0x0000000000000000000000000000000000008141";
+
+/// EIP-8250: maximum number of nonce keys a single frame transaction may select.
+pub const FRAME_TX_MAX_NONCE_KEYS: usize = 16;
+
+/// EIP-8250 `NONCE_MANAGER` system contract address (`0x…8250`). Non-zero keyed
+/// nonce sequences live in this contract's storage; the broadcaster reads the
+/// relevant slot to resolve the current sequence for a key.
+pub const NONCE_MANAGER_ADDRESS: &str = "0x0000000000000000000000000000000000008250";
+
+/// EIP-8272: maximum number of recent-root references a single frame
+/// transaction may declare.
+pub const FRAME_TX_MAX_RECENT_ROOT_REFERENCES: usize = 16;
+
+fn default_nonce_keys() -> Vec<U256> {
+    vec![U256::ZERO]
+}
 
 /// The execution mode of a single frame within an EIP-8141 Frame Transaction.
 ///
@@ -22,10 +58,6 @@ pub enum FrameMode {
     ///
     /// The caller address observed inside this frame is ENTRY_POINT (0xaa),
     /// not the sender.
-    ///
-    /// Crucially, the `data` field of VERIFY frames is elided from the
-    /// canonical signature hash. This is what allows sponsors to inject
-    /// their signature after the sender has already signed the transaction.
     Verify,
 
     /// SENDER mode (mode = 2).
@@ -79,7 +111,7 @@ pub struct Frame {
     /// to approve via the APPROVE opcode:
     ///   - 0x01 = APPROVE_PAYMENT     (payer approval only)
     ///   - 0x02 = APPROVE_EXECUTION   (sender approval only)
-    ///   - 0x03 = APPROVE_PAYMENT_AND_EXECUTION (both, atomically)
+    ///   - 0x03 = APPROVE_EXECUTION_AND_PAYMENT (both, atomically)
     ///
     /// Bit 2 is the ATOMIC_BATCH_FLAG. When set on a SENDER frame, it groups
     /// this frame with the next SENDER frame into an all-or-nothing atomic batch.
@@ -99,7 +131,7 @@ pub struct Frame {
     /// for VERIFY frames (unlike `data`, which is elided). This means the sender
     /// explicitly commits to which address will act as their sponsor/paymaster —
     /// it cannot be swapped after signing.
-    pub target: String,
+    pub target: Option<String>,
 
     /// The maximum amount of gas allocated to this frame's execution.
     ///
@@ -137,34 +169,83 @@ pub struct Frame {
     pub data: String,
 }
 
-/// An abstract, pre-broadcast representation of an EIP-8141/8250 Frame Transaction.
+/// EIP-8272 recent-root reference: a declared `(source_id, slot, root)` tuple.
+///
+/// `root` is opaque to consensus — applications bind its meaning. `slot` is a
+/// beacon slot number (`< 2**64`). References are appended as the last RLP
+/// envelope field and are covered by the canonical signature hash, so they
+/// cannot be altered after signing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentRootReference {
+    /// Identifies the root source (32 bytes).
+    pub source_id: B256,
+    /// Beacon slot number the reference is anchored to.
+    pub slot: u64,
+    /// The referenced root (32 bytes, opaque to consensus).
+    pub root: B256,
+}
+
+/// EIP-8141 Signature object.
+///
+/// Signatures are referenced by VERIFY frames or normal EVM execution.
+/// If `msg` is empty, the signature is signed over the canonical transaction signature hash.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameSignature {
+    /// 0x0 for SECP256K1, 0x1 for P256.
+    pub scheme: u8,
+    /// Signer metadata. For SECP256K1/P256 this is a 20-byte address.
+    pub signer: String,
+    /// Explicit 32-byte digest, or empty to sign `compute_sig_hash(tx)`.
+    pub msg: String,
+    /// The raw signature bytes.
+    pub signature: String,
+}
+
+/// An abstract, pre-broadcast representation of an EIP-8141 Frame Transaction.
 ///
 /// This struct is the internal currency of the pipeline — it lives in the Redis
 /// queue between the `FrameCompiler` (which validates and signs it) and the
 /// `MempoolBroadcaster` (which resolves the nonce, RLP-encodes it, and sends it).
 ///
-/// It is intentionally kept in a mutable, human-readable form so that the
-/// Broadcaster can patch gas fees and nonce via RPC reconciliation before
-/// final encoding. It is NOT the wire format — that is produced by
+/// It is kept in a human-readable form for queue storage and inspection, but
+/// its signed fields (fees, `nonce_seq`, frames) are immutable once signed —
+/// they are covered by the canonical signature hash. The Broadcaster does not
+/// patch anything: it only reconciles the keyed nonce *state* to decide
+/// whether the transaction is executable now, must be held, or is superseded.
+/// It is NOT the wire format — that is produced by
 /// `Eip8141Encoder::encode_transaction` at broadcast time.
 ///
-/// The on-wire RLP layout per the spec is:
-/// `[chain_id, nonce_key, nonce_seq, sender, frames, max_priority_fee_per_gas, max_fee_per_gas,
-///   max_fee_per_blob_gas, blob_versioned_hashes]`
+/// The on-wire RLP layout (EIP-8141 as amended by EIP-8250 keyed nonces and
+/// EIP-8272 recent-root references) is:
+/// `[chain_id, nonce_keys, nonce_seq, sender, frames, signatures,
+///   max_priority_fee_per_gas, max_fee_per_gas, max_fee_per_blob_gas,
+///   blob_versioned_hashes, recent_root_references]`
 ///
-/// See: EIP-8250 "Keyed Nonces for Frame Transactions" section.
+/// See: EIP-8250 "Keyed Nonces for Frame Transactions".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrameTransaction {
     /// The EIP-155 chain ID, used to prevent replay attacks across networks.
     pub chain_id: u64,
 
-    /// EIP-8250 Nonce Key (uint256).
-    /// nonce_key == 0 aliases the legacy account nonce.
-    /// Non-zero keys select independent protocol-managed sequences.
-    pub nonce_key: alloy::primitives::U256,
+    /// EIP-8250 nonce keys, each a `uint256`. Between 1 and
+    /// `FRAME_TX_MAX_NONCE_KEYS` keys, strictly increasing by numeric value.
+    ///
+    /// `[0]` aliases the sender's legacy account nonce; each non-zero key selects
+    /// an independent, protocol-managed sequence stored in the `NONCE_MANAGER`
+    /// system contract. Transactions whose non-zero key sets are disjoint are
+    /// replay-independent, so a single shared sender is no longer a single-lane
+    /// nonce bottleneck. Key `0` is only valid as the sole key (`[0]`).
+    ///
+    /// Defaults to `[0]` (the legacy domain) when omitted from the payload.
+    #[serde(default = "default_nonce_keys")]
+    pub nonce_keys: Vec<U256>,
 
-    /// EIP-8250 Nonce Sequence (uint64).
-    /// `None` at compile time — resolved by the Broadcaster.
+    /// EIP-8250 nonce sequence (`uint64`), shared across every selected key.
+    ///
+    /// The transaction is executable only when `nonce_seq` equals the current
+    /// sequence of every selected key (`current_nonce_seq(sender, key)`). `None`
+    /// until supplied by the client — but note it is covered by the canonical
+    /// signature hash, so it cannot be patched after signing.
     pub nonce_seq: Option<u64>,
 
     /// The sending account's address (hex-encoded, 20 bytes).
@@ -180,16 +261,33 @@ pub struct FrameTransaction {
 
     /// The maximum priority fee per gas unit (tip), in wei (EIP-1559).
     ///
-    /// `None` until the Broadcaster resolves current network conditions.
-    /// Included in the canonical signature hash, so cannot be altered post-signing.
+    /// Must be set by the client before signing: it is covered by the
+    /// canonical signature hash and can never be patched afterwards. The
+    /// compiler rejects transactions without it — a missing fee would encode
+    /// as 0 and is guaranteed to fail admission at the node.
     pub max_priority_fee_per_gas: Option<u128>,
 
     /// The maximum total fee per gas unit the sender is willing to pay, in wei (EIP-1559).
     ///
-    /// `None` until the Broadcaster resolves current network conditions.
     /// The actual cost per gas will be `min(max_fee_per_gas, base_fee + max_priority_fee_per_gas)`.
-    /// Included in the canonical signature hash.
+    /// Like the priority fee, it is covered by the canonical signature hash:
+    /// required before signing, unpatchable after, and enforced by the
+    /// compiler. A fee bump therefore requires a fully re-signed transaction.
     pub max_fee_per_gas: Option<u128>,
+
+    /// The maximum total fee per blob gas unit, in wei (EIP-4844).
+    #[serde(default)]
+    pub max_fee_per_blob_gas: Option<U256>,
+
+    /// EIP-4844 blob versioned hashes.
+    #[serde(default)]
+    pub blob_versioned_hashes: Vec<B256>,
+
+    /// EIP-8272 declared recent-root references. At most
+    /// [`FRAME_TX_MAX_RECENT_ROOT_REFERENCES`]. Encoded as the last RLP
+    /// envelope field and covered by the canonical signature hash.
+    #[serde(default)]
+    pub recent_root_references: Vec<RecentRootReference>,
 
     /// The ordered list of frames that make up this transaction's execution.
     ///
@@ -205,6 +303,30 @@ pub struct FrameTransaction {
     /// Any frames after payer approval (user_op, post_op) are unrestricted.
     /// Must contain at least 1 and at most MAX_FRAMES (64) frames.
     pub frames: Vec<Frame>,
+
+    /// List of validated signatures available to the transaction.
+    #[serde(default)]
+    pub signatures: Vec<FrameSignature>,
+}
+
+impl FrameTransaction {
+    /// The selected nonce keys, falling back to the legacy domain `[0]` when the
+    /// list is empty. Encoding and reconciliation go through this so an empty
+    /// list is always treated as the legacy account nonce.
+    pub fn effective_nonce_keys(&self) -> Vec<U256> {
+        if self.nonce_keys.is_empty() {
+            vec![U256::ZERO]
+        } else {
+            self.nonce_keys.clone()
+        }
+    }
+
+    /// Whether this transaction uses only the legacy account-nonce domain (`[0]`),
+    /// which the broadcaster can resolve with a plain `eth_getTransactionCount`.
+    pub fn is_legacy_nonce(&self) -> bool {
+        let keys = self.effective_nonce_keys();
+        keys.len() == 1 && keys[0].is_zero()
+    }
 }
 
 #[cfg(test)]
@@ -212,11 +334,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_frame_serialization() {
+    fn frame_serialization() {
         let frame = Frame {
             mode: FrameMode::Sender,
             flags: 0x02,
-            target: "0x1234567890123456789012345678901234567890".to_string(),
+            target: Some("0x1234567890123456789012345678901234567890".to_string()),
             gas_limit: 100000,
             value: "1000000000000000000".to_string(), // 1 ETH
             data: "0x".to_string(),
@@ -232,158 +354,3 @@ mod tests {
         assert_eq!(decoded.flags, 2);
     }
 }
-
-
-// Some changes were made for EIP8250 support. Just to keep track of the changes in case we need to revert. I placed them here:
-// Edit  signer.rs → Accepted (+31, -0)
-
-//       43           Ok(Bytes::from(signature.as_bytes().to_vec()))
-//       44       }
-//       45   }
-//       46 +
-//       47 + #[cfg(test)]
-//       48 + mod tests {
-//       49 +     use super::*;
-//       50 +     use alloy::primitives::b256;
-//       51 +
-//       52 +     #[test]
-//       53 +     fn test_in_memory_signer_invalid_key() {
-//       54 +         let result = InMemorySigner::new("invalid_hex_key");
-//       55 +         assert!(result.is_err());
-//       56 +         match result {
-//       57 +             Err(SignerError::SignError(msg)) => {
-//       58 +                 assert!(msg.contains("Invalid private key"));
-//       59 +             }
-//       60 +             _ => panic!("Expected SignError"),
-//       61 +         }
-//       62 +     }
-//       63 +
-//       64 +     #[tokio::test]
-//       65 +     async fn test_in_memory_signer_sign_hash() {
-//       66 +         let pk_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-//       67 +         let signer = InMemorySigner::new(pk_hex).expect("Failed to create signer");
-//       68 +
-//       69 +         let hash = b256!("0000000000000000000000000000000000000000000000000000000000000000");
-//       70 +         let result = signer.sign_hash(&hash).await;
-//       71 +
-//       72 +         assert!(result.is_ok());
-//       73 +         let signature = result.unwrap();
-//       74 +         assert_eq!(signature.len(), 65);
-//       75 +     }
-//       76 + }
-
-//   ✓  Edit  gateway.rs → Accepted (+19, -0)
-
-//        81           Ok(hash)
-//        82       }
-//        83   }
-//        84 +
-//        85 + #[cfg(test)]
-//        86 + mod tests {
-//        87 +     use super::*;
-//        88 +
-//        89 +     #[test]
-//        90 +     #[should_panic(expected = "Invalid RPC URL")]
-//        91 +     fn test_alloy_gateway_invalid_url() {
-//        92 +         let _gateway = AlloyGateway::new("not-a-valid-url");
-//        93 +     }
-//        94 +
-//        95 +     #[test]
-//        96 +     fn test_alloy_gateway_valid_url() {
-//        97 +         // This should just parse successfully
-//        98 +         let gateway = AlloyGateway::new("http://localhost:8545");
-//        99 +         // Check if provider exists
-//       100 +         let _ = gateway.provider;
-//       101 +     }
-//       102 + }
-
-// │                                                                                                                                             │
-// │ ✓  Shell cargo test -p open_engine_core                                                                                                     │
-// │                                                                                                                                             │
-// │ ... first 1 line hidden (Ctrl+O to show) ...                                                                                                │
-// │ error[E0433]: cannot find module or crate `tokio` in this scope                                                                             │
-// │   --> core/src/signer.rs:64:7                                                                                                               │
-// │    |                                                                                                                                        │
-// │ 64 |     #[tokio::test]                                                                                                                     │
-// │    |       ^^^^^ use of unresolved module or unlinked crate `tokio`                                                                         │
-// │                                                                                                                                             │
-// │ For more information about this error, try `rustc --explain E0433`.                                                                         │
-// │ error: could not compile `open_engine_core` (lib test) due to 1 previous error                                                              │
-// │ warning: build failed, waiting for other jobs to finish...                                                                                  │
-// ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
-//   ✓  ReadFile  Documents/.../Cargo.toml
-//   ✓  Edit  Cargo.toml → Accepted (+3, -0)
-
-//        8   serde_json = { workspace = true }
-//        9   thiserror = { workspace = true }
-//       10   alloy = { version = "0.1.3", features = ["serde", "signers", "rlp", "signer-local", "providers", "transport-http"] }
-//       11 +
-//       12 + [dev-dependencies]
-//       13 + tokio = { workspace = true }
-
-// │                                                                                                                                             │
-// │ ✓  Shell cargo test -p open_engine_core                                                                                                     │
-// │                                                                                                                                             │
-// │ ... first 26 lines hidden (Ctrl+O to show) ...                                                                                              │
-// │                                                                                                                                             │
-// │ test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s                                               │
-// │                                                                                                                                             │
-// │    Doc-tests open_engine_core                                                                                                               │
-// │                                                                                                                                             │
-// │ running 0 tests                                                                                                                             │
-// │                                                                                                                                             │
-// │ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s                                               │
-// │                                                                                                                                             │
-// ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
-//   Testing Domain and Encoding Modules: Adding tests for the domain model and the encoder to complete the core module test coverage.
-
-//   ✓  Edit  domain.rs → Accepted (+26, -0)
-
-//       212       /// Must contain at least 1 and at most MAX_FRAMES (64) frames.
-//       213       pub frames: Vec<Frame>,
-//       214   }
-//       215 +
-//       216 + #[cfg(test)]
-//       217 + mod tests {
-//       218 +     use super::*;
-//       219 +
-//       220 +     #[test]
-//       221 +     fn test_frame_serialization() {
-//       222 +         let frame = Frame {
-//       223 +             mode: FrameMode::Sender,
-//       224 +             flags: 0x02,
-//       225 +             target: "0x1234567890123456789012345678901234567890".to_string(),
-//       226 +             gas_limit: 100000,
-//       227 +             value: "1000000000000000000".to_string(), // 1 ETH
-//       228 +             data: "0x".to_string(),
-//       229 +         };
-//       230 +
-//       231 +         let json = serde_json::to_string(&frame).expect("Failed to serialize");
-//       232 +         assert!(json.contains(r#""mode":"Sender""#));
-//       233 +         assert!(json.contains(r#""flags":2"#));
-//       234 +         assert!(json.contains(r#""value":"1000000000000000000""#));
-//       235 +
-//       236 +         let decoded: Frame = serde_json::from_str(&json).expect("Failed to deserialize");
-//       237 +         assert!(matches!(decoded.mode, FrameMode::Sender));
-//       238 +         assert_eq!(decoded.flags, 2);
-//       239 +     }
-//       240 + }
-
-//   ✓  Edit  encoding.rs → Accepted (+12, -0)
-
-//       244           // The hash should be perfectly identical because the data fields are elided!
-//       245           assert_eq!(sig_hash_before, sig_hash_after);
-//       246       }
-//       247 +
-//       248 +     #[test]
-//       249 +     fn test_encode_transaction_includes_prefix() {
-//       250 +         let tx = create_test_tx();
-//       251 +         let encoded = Eip8141Encoder::encode_transaction(&tx);
-//       252 +
-//       253 +         // EIP-8141 defines FRAME_TX_TYPE as 0x06
-//       254 +         assert_eq!(encoded[0], 0x06);
-//       255 +
-//       256 +         // Ensure it's successfully encoded into multiple bytes
-//       257 +         assert!(encoded.len() > 10);
-//       258 +     }
-//       259   }

@@ -85,7 +85,7 @@ async fn cleanup_redis_keys(conn_manager: &ConnectionManager, queue_name: &str) 
 }
 
 #[tokio::test]
-async fn test_permanent_idempotency_mode() {
+async fn permanent_idempotency_mode() {
     let queue_name = format!("test_perm_{}", nanoid::nanoid!(6));
     let processed_count = Arc::new(AtomicUsize::new(0));
 
@@ -172,7 +172,7 @@ async fn test_permanent_idempotency_mode() {
 }
 
 #[tokio::test]
-async fn test_active_idempotency_mode() {
+async fn active_idempotency_mode() {
     let queue_name = format!("test_active_{}", nanoid::nanoid!(6));
     let processed_count = Arc::new(AtomicUsize::new(0));
 

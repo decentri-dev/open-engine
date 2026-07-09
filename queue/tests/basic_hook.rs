@@ -158,11 +158,11 @@ impl DurableExecution for WebhookJobHandler {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_cross_queue_job_scheduling() {
+async fn cross_queue_job_scheduling() {
     tracing_subscriber::registry()
         .with(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "thirdweb_engine=debug,tower_http=debug,axum=debug".into()),
+                .unwrap_or_else(|_| "engine=debug,tower_http=debug,axum=debug".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
