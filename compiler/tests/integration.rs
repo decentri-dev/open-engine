@@ -5,7 +5,7 @@ use alloy::primitives::{B256};
 use broadcaster::MempoolBroadcaster;
 use compiler::FrameCompiler;
 use open_engine_core::domain::{Frame, FrameMode, FrameSignature, FrameTransaction};
-use open_engine_core::signer::InMemorySigner;
+use open_engine_core::signer::{InMemorySigner, Signer};
 use queue::DurableExecution;
 use std::sync::Arc;
 
@@ -102,9 +102,11 @@ async fn compiles_and_queues_sponsored_tx() {
     let compiler = FrameCompiler::new(gateway.clone(), sponsor_signer.clone());
     let broadcaster = MempoolBroadcaster::new(gateway.clone());
 
-    // 2. Create a Sponsored Transaction
+    // 2. Create a Sponsored Transaction. The paymaster frame must target the
+    //    account our signer controls — the compiler only signs a sponsor frame
+    //    whose target matches its own address (the self-check).
     let sender = DUMMY_SENDER.to_string();
-    let paymaster = "0x9999999999999999999999999999999999999999".to_string();
+    let paymaster = format!("{:#x}", sponsor_signer.address());
 
     let tx = FrameTransaction {
         chain_id: 1,

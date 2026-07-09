@@ -7,7 +7,16 @@ use axum::{
 };
 use broadcaster::MempoolBroadcaster;
 use compiler::FrameCompiler;
-use open_engine_core::{domain::FrameTransaction, gateway::AlloyGateway, signer::InMemorySigner};
+mod policy_store;
+
+use open_engine_core::{
+    domain::FrameTransaction,
+    gateway::AlloyGateway,
+    policy::{Posture, PolicyStore, SponsorPolicy},
+    signer::{Signer, SponsorSigner},
+};
+use policy_store::RedisPolicyStore;
+use std::collections::HashSet;
 use queue::{job::JobOptions, PushOutcome, Queue, ReplaceOutcome};
 use serde::Serialize;
 use std::sync::Arc;
@@ -127,7 +136,7 @@ fn response(
 }
 
 type AppQueue = Queue<MempoolBroadcaster<AlloyGateway>>;
-type AppCompiler = FrameCompiler<AlloyGateway, InMemorySigner>;
+type AppCompiler = FrameCompiler<AlloyGateway, SponsorSigner>;
 
 #[derive(Clone)]
 struct AppState {
@@ -331,6 +340,132 @@ async fn handle_resubmission(
     })
 }
 
+/// Resolves the sponsor signer from configuration.
+///
+/// `SPONSOR_SIGNER` selects the custody backend by URI scheme (`raw:`,
+/// `aws-kms:`, `gcp-kms:` — see [`SponsorSigner::from_uri`]). For backward
+/// compatibility a bare `SPONSOR_KEY` is still accepted and mapped to `raw:`,
+/// with a deprecation warning. The raw backend loads the private key into
+/// process memory, so it warns loudly and should be replaced by a KMS backend
+/// for any funded sponsor.
+async fn build_sponsor_signer() -> SponsorSigner {
+    let uri = match std::env::var("SPONSOR_SIGNER") {
+        Ok(uri) => uri,
+        Err(_) => match std::env::var("SPONSOR_KEY") {
+            Ok(key) => {
+                tracing::warn!(
+                    "SPONSOR_KEY is deprecated; set SPONSOR_SIGNER=raw:<hex> (or aws-kms:/gcp-kms:) instead"
+                );
+                format!("raw:{key}")
+            }
+            Err(_) => panic!(
+                "SPONSOR_SIGNER must be set (e.g. raw:0x<hex>, aws-kms:<key-id>?region=<r>, or gcp-kms:<resource>)"
+            ),
+        },
+    };
+
+    if uri.starts_with("raw:") {
+        tracing::warn!(
+            "Sponsor signer is an in-process raw key. For a funded sponsor use aws-kms:/gcp-kms: so the private key never enters the process."
+        );
+    }
+
+    // Frame-tx signing operates on raw digests, so no chain id is needed here.
+    let signer = SponsorSigner::from_uri(&uri, None)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to initialize sponsor signer: {e}"));
+
+    tracing::info!(sponsor_address = %signer.address(), signer = ?signer, "Sponsor signer initialized");
+    signer
+}
+
+/// Parses a base-10 wei value from an environment string, aborting on error.
+fn parse_wei(value: String) -> alloy::primitives::U256 {
+    value
+        .parse::<alloy::primitives::U256>()
+        .unwrap_or_else(|e| panic!("expected a base-10 u256 wei value, got '{value}': {e}"))
+}
+
+/// Builds the sponsor policy from environment and validates it against the
+/// selected posture.
+///
+/// `OPEN_ENGINE_MODE` picks the posture (`gated` default, or `public`). The
+/// stateless guards read here are `SPONSOR_MAX_COST_WEI` (per-tx spend ceiling)
+/// and `SPONSOR_SENDER_ALLOWLIST` (comma-separated addresses). Stateful guards
+/// (per-sender quota, global budget) are wired separately when configured.
+/// In `public` mode a policy that does not bound both spend and admission is a
+/// fatal misconfiguration and aborts boot (fail closed).
+async fn build_sponsor_policy(redis_url: &str) -> SponsorPolicy {
+    let posture = std::env::var("OPEN_ENGINE_MODE")
+        .ok()
+        .map(|value| Posture::parse(&value).unwrap_or_else(|e| panic!("{e}")))
+        .unwrap_or(Posture::Gated);
+
+    let max_cost_wei = std::env::var("SPONSOR_MAX_COST_WEI").ok().map(parse_wei);
+
+    let sender_allowlist = std::env::var("SPONSOR_SENDER_ALLOWLIST").ok().map(|value| {
+        value
+            .split(',')
+            .map(|entry| entry.trim())
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+                entry
+                    .parse::<alloy::primitives::Address>()
+                    .unwrap_or_else(|e| panic!("SPONSOR_SENDER_ALLOWLIST entry '{entry}' is not a valid address: {e}"))
+            })
+            .collect::<HashSet<_>>()
+    });
+
+    // Stateful guards (per-sender windowed quota + global budget) are wired to
+    // Redis only when configured; otherwise the store stays absent so gated
+    // deployments have no policy Redis coupling.
+    let per_sender = std::env::var("SPONSOR_PER_SENDER_MAX_COST_PER_WINDOW")
+        .ok()
+        .map(parse_wei);
+    let global_budget = std::env::var("SPONSOR_GLOBAL_BUDGET_WEI").ok().map(parse_wei);
+    let window_secs = std::env::var("SPONSOR_QUOTA_WINDOW_SECS")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .unwrap_or_else(|e| panic!("SPONSOR_QUOTA_WINDOW_SECS must be a u64: {e}"))
+        })
+        .unwrap_or(3600);
+
+    let store: Option<Arc<dyn PolicyStore>> = if per_sender.is_some() || global_budget.is_some() {
+        let store = RedisPolicyStore::connect(redis_url, per_sender, window_secs, global_budget)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to connect sponsor policy store to Redis: {e}"));
+        Some(Arc::new(store))
+    } else {
+        None
+    };
+
+    let policy = SponsorPolicy {
+        max_cost_wei,
+        sender_allowlist,
+        store,
+    };
+
+    if let Err(e) = policy.validate_for(posture) {
+        panic!("Sponsor policy is unsafe for OPEN_ENGINE_MODE={posture:?}: {e}");
+    }
+
+    if posture == Posture::Gated && !policy.has_spend_guard() {
+        tracing::warn!(
+            "No sponsor spend ceiling configured (SPONSOR_MAX_COST_WEI unset). A single transaction can charge the sponsor its full max_cost; set a ceiling for defense-in-depth."
+        );
+    }
+
+    tracing::info!(
+        posture = ?posture,
+        spend_guard = policy.has_spend_guard(),
+        admission_guard = policy.has_admission_guard(),
+        "Sponsor policy initialized"
+    );
+    policy
+}
+
 #[tokio::main]
 async fn main() {
     // Initialize tracing
@@ -343,17 +478,21 @@ async fn main() {
 
     // Configuration (In production, these come from Env/Config)
     let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| "http://localhost:8545".into());
-    let sponsor_key = std::env::var("SPONSOR_KEY").expect("SPONSOR_KEY must be set");
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".into());
 
     // Initialize Components
     let gateway = Arc::new(AlloyGateway::new(&rpc_url));
-    let signer = Arc::new(InMemorySigner::new(&sponsor_key).expect("Invalid SPONSOR_KEY"));
+    let signer = Arc::new(build_sponsor_signer().await);
+    let policy = build_sponsor_policy(&redis_url).await;
 
-    let compiler = Arc::new(FrameCompiler::new(gateway.clone(), signer.clone()));
+    let compiler = Arc::new(FrameCompiler::with_policy(
+        gateway.clone(),
+        signer.clone(),
+        policy,
+    ));
 
     let broadcaster = MempoolBroadcaster::new(gateway.clone());
 
-    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".into());
     let queue = AppQueue::builder()
         .name("frames")
         .redis_url(redis_url)

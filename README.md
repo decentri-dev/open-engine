@@ -35,16 +35,59 @@ The `open-engine` workspace is composed of five primary modules operating synchr
    ```
 
 2. **Run the API**:
-   Starting the API initializes the Compiler, Queue, Broadcaster, and queue worker. It connects to Redis and expects an RPC endpoint plus sponsor key:
+   Starting the API initializes the Compiler, Queue, Broadcaster, and queue worker. It connects to Redis and expects an RPC endpoint plus a sponsor signer:
    ```bash
    export RPC_URL=http://localhost:8545
-   export SPONSOR_KEY=<hex-encoded-sponsor-key>
+   export SPONSOR_SIGNER=raw:<hex-encoded-sponsor-key>
    cargo run -p api
    ```
 
    The `MAX_VERIFY_GAS` admission budget is a fixed constant that mirrors the
    network's mempool policy (see `open_engine_core::domain::MAX_VERIFY_GAS`);
    it is deliberately not configurable per instance.
+
+#### Sponsor signer (`SPONSOR_SIGNER`)
+
+The sponsor signer is selected by URI scheme so the private key's custody is a
+deployment decision, not a code change:
+
+| Scheme | Example | Notes |
+| --- | --- | --- |
+| `raw` | `raw:0xabc…` | Loads the key into process memory. Dev/local only; warns at boot. |
+| `aws-kms` | `aws-kms:alias/sponsor?region=eu-west-1` | Key stays in AWS KMS. Build with `--features signer-aws`. |
+| `gcp-kms` | `gcp-kms:projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1` | Key stays in GCP Cloud KMS. Build with `--features signer-gcp`. |
+
+KMS backends are off by default, so a plain build pulls in no cloud SDK:
+```bash
+cargo run -p api --features signer-aws          # or signer-gcp, or both
+```
+`SPONSOR_KEY` (bare hex) is still accepted for backward compatibility and is
+treated as `raw:`, with a deprecation warning.
+
+#### Deployment posture and sponsor policy
+
+`OPEN_ENGINE_MODE` selects how much the sponsor policy is trusted to do:
+
+- `gated` (default) — open-engine sits behind a trusted service that authenticates
+  and validates callers. Policy guards are optional defense-in-depth.
+- `public` — open-engine is the untrusted-facing entry point. Policy is the only
+  thing protecting sponsor funds, so boot **fails closed** unless the policy bounds
+  both spend and admission.
+
+Policy guards (all optional in `gated`, required as noted in `public`):
+
+| Env var | Guard |
+| --- | --- |
+| `SPONSOR_MAX_COST_WEI` | Per-transaction ceiling on the sponsor's `max_cost` exposure. |
+| `SPONSOR_SENDER_ALLOWLIST` | Comma-separated addresses; only these senders may be sponsored. |
+| `SPONSOR_PER_SENDER_MAX_COST_PER_WINDOW` + `SPONSOR_QUOTA_WINDOW_SECS` | Redis-backed per-sender windowed spend quota. |
+| `SPONSOR_GLOBAL_BUDGET_WEI` | Redis-backed cumulative sponsor budget. |
+
+In `public` mode, boot aborts unless the policy sets a spend bound (ceiling or
+budget) **and** an admission bound (allowlist or per-sender quota). The compiler
+only ever signs a paymaster frame whose target is the sponsor signer's own
+address, so a request cannot get the sponsor signature attached to a frame the
+engine does not control.
 
 ### Submitting a Frame Transaction via cURL
 

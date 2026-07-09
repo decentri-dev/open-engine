@@ -225,6 +225,26 @@ impl Eip8141Encoder {
         out
     }
 
+    /// Encodes the list of recent-root references into RLP bytes (as an RLP
+    /// list), matching the envelope encoding so calldata-gas accounting agrees
+    /// with the node.
+    pub fn encode_recent_root_references(refs: &[RecentRootReference]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut payload_length = 0;
+        for reference in refs {
+            payload_length += reference.length();
+        }
+        let header = alloy::rlp::Header {
+            list: true,
+            payload_length,
+        };
+        header.encode(&mut out);
+        for reference in refs {
+            reference.encode(&mut out);
+        }
+        out
+    }
+
     /// Encodes the list of signatures into RLP bytes.
     pub fn encode_signatures(signatures: &[FrameSignature]) -> Vec<u8> {
         let mut out = Vec::new();

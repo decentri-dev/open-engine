@@ -32,6 +32,18 @@ pub const NONCE_MANAGER_ADDRESS: &str = "0x0000000000000000000000000000000000008
 /// transaction may declare.
 pub const FRAME_TX_MAX_RECENT_ROOT_REFERENCES: usize = 16;
 
+/// EIP-8272 recent-root reference intrinsic gas: a flat per-transaction charge
+/// when any reference is present, plus a per-reference charge. Mirrors the
+/// network's admission accounting so [`FrameTransaction::total_gas_limit`]
+/// matches what the node computes.
+pub const FRAME_TX_RECENT_ROOT_REFERENCE_ADDRESS_GAS: u64 = 2400;
+pub const FRAME_TX_RECENT_ROOT_REFERENCE_GAS: u64 = 1900 + 2 * 30 + 7 * 6;
+
+/// EIP-8141 signature-verification gas by scheme (used in the gas total and the
+/// validation-prefix budget): SECP256K1 = 2800, P256 = 6700.
+pub const FRAME_SIG_COST_SECP256K1: u64 = 2800;
+pub const FRAME_SIG_COST_P256: u64 = 6700;
+
 fn default_nonce_keys() -> Vec<U256> {
     vec![U256::ZERO]
 }
@@ -327,6 +339,78 @@ impl FrameTransaction {
         let keys = self.effective_nonce_keys();
         keys.len() == 1 && keys[0].is_zero()
     }
+
+    /// EIP-8141 signature-verification gas across all signatures. Unknown
+    /// schemes are rejected by validation before this matters, so they
+    /// contribute 0 here.
+    pub fn signature_verification_cost(&self) -> u64 {
+        self.signatures
+            .iter()
+            .map(|sig| match sig.scheme {
+                0 => FRAME_SIG_COST_SECP256K1,
+                1 => FRAME_SIG_COST_P256,
+                _ => 0,
+            })
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Total gas the payer may be charged for, mirroring the network's admission
+    /// accounting (saturating): intrinsic + per-frame + calldata (frames +
+    /// signatures + recent-root references) + signature verification + the sum
+    /// of all frame gas limits + recent-root intrinsic gas.
+    ///
+    /// Kept byte-for-byte aligned with the node so [`Self::max_cost`] and the
+    /// compiler's preflight cross-check agree with what the mempool computes.
+    pub fn total_gas_limit(&self) -> u64 {
+        use crate::encoding::Eip8141Encoder;
+
+        let frames_rlp = Eip8141Encoder::encode_frames(&self.frames);
+        let signatures_rlp = Eip8141Encoder::encode_signatures(&self.signatures);
+        let mut calldata_gas = Eip8141Encoder::calldata_cost(&frames_rlp)
+            .saturating_add(Eip8141Encoder::calldata_cost(&signatures_rlp));
+
+        // Recent-root references only cost gas when present; guarded so a
+        // reference-free transaction's total stays identical to the pre-EIP-8272
+        // computation.
+        let recent_root_gas = if self.recent_root_references.is_empty() {
+            0
+        } else {
+            let refs_rlp = Eip8141Encoder::encode_recent_root_references(&self.recent_root_references);
+            calldata_gas = calldata_gas.saturating_add(Eip8141Encoder::calldata_cost(&refs_rlp));
+            FRAME_TX_RECENT_ROOT_REFERENCE_ADDRESS_GAS.saturating_add(
+                (self.recent_root_references.len() as u64)
+                    .saturating_mul(FRAME_TX_RECENT_ROOT_REFERENCE_GAS),
+            )
+        };
+
+        let frame_gas = self
+            .frames
+            .iter()
+            .map(|f| f.gas_limit)
+            .fold(0u64, u64::saturating_add);
+
+        FRAME_TX_INTRINSIC_COST
+            .saturating_add((self.frames.len() as u64).saturating_mul(FRAME_TX_PER_FRAME_COST))
+            .saturating_add(calldata_gas)
+            .saturating_add(self.signature_verification_cost())
+            .saturating_add(frame_gas)
+            .saturating_add(recent_root_gas)
+    }
+
+    /// The maximum the payer may be charged (EIP-8141 TXPARAM `0x06`), mirroring
+    /// the network's reservation formula (saturating):
+    /// `max_fee_per_gas * total_gas_limit + len(blob_hashes) * 131072 * max_fee_per_blob_gas`.
+    ///
+    /// Fees are `None` only before the compiler's required fee check; they are
+    /// treated as 0 here so the function is always total.
+    pub fn max_cost(&self) -> U256 {
+        let gas_cost = U256::from(self.max_fee_per_gas.unwrap_or(0))
+            .saturating_mul(U256::from(self.total_gas_limit()));
+        let blob_cost = U256::from(self.blob_versioned_hashes.len())
+            .saturating_mul(U256::from(131072u64))
+            .saturating_mul(self.max_fee_per_blob_gas.unwrap_or_default());
+        gas_cost.saturating_add(blob_cost)
+    }
 }
 
 #[cfg(test)]
@@ -352,5 +436,64 @@ mod tests {
         let decoded: Frame = serde_json::from_str(&json).expect("Failed to deserialize");
         assert!(matches!(decoded.mode, FrameMode::Sender));
         assert_eq!(decoded.flags, 2);
+    }
+
+    fn sample_tx() -> FrameTransaction {
+        FrameTransaction {
+            chain_id: 1,
+            nonce_keys: vec![U256::ZERO],
+            nonce_seq: Some(0),
+            sender: "0x1111111111111111111111111111111111111111".to_string(),
+            max_priority_fee_per_gas: Some(1),
+            max_fee_per_gas: Some(20),
+            max_fee_per_blob_gas: Some(U256::ZERO),
+            blob_versioned_hashes: vec![],
+            recent_root_references: vec![],
+            frames: vec![Frame {
+                mode: FrameMode::Verify,
+                flags: 0x03,
+                target: Some("0x1111111111111111111111111111111111111111".to_string()),
+                gas_limit: 50_000,
+                value: "0".to_string(),
+                data: "0x".to_string(),
+            }],
+            signatures: vec![FrameSignature {
+                scheme: 0,
+                signer: "0x1111111111111111111111111111111111111111".to_string(),
+                msg: "".to_string(),
+                signature: "0x1234".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn total_gas_limit_sums_components() {
+        let tx = sample_tx();
+        let gas = tx.total_gas_limit();
+        // Must at least cover intrinsic + per-frame + the one SECP256K1 sig +
+        // the frame's own gas limit.
+        let lower_bound = FRAME_TX_INTRINSIC_COST
+            + FRAME_TX_PER_FRAME_COST
+            + FRAME_SIG_COST_SECP256K1
+            + 50_000;
+        assert!(gas > lower_bound, "gas {gas} should exceed {lower_bound} once calldata is added");
+    }
+
+    #[test]
+    fn max_cost_is_fee_times_gas_without_blobs() {
+        let tx = sample_tx();
+        let expected = U256::from(20u64) * U256::from(tx.total_gas_limit());
+        assert_eq!(tx.max_cost(), expected);
+    }
+
+    #[test]
+    fn max_cost_includes_blob_cost() {
+        let mut tx = sample_tx();
+        let without = tx.max_cost();
+        tx.max_fee_per_blob_gas = Some(U256::from(3u64));
+        tx.blob_versioned_hashes = vec![B256::ZERO, B256::ZERO];
+        // Adds len * 131072 * blob_fee = 2 * 131072 * 3.
+        let expected = without + U256::from(2u64) * U256::from(131072u64) * U256::from(3u64);
+        assert_eq!(tx.max_cost(), expected);
     }
 }
