@@ -1,5 +1,3 @@
-// In your test file or test module
-
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -44,8 +42,8 @@ impl UserCancellable for TestJobErrorData {
     }
 }
 
-// Use a static AtomicBool to signal from the job process to the test
-// In a real scenario, you'd check queue state or results in Redis.
+// Static flag signaling job completion to the test; production callers read
+// queue state and results from Redis instead.
 pub static TEST_JOB_PROCESSED_SUCCESSFULLY: AtomicBool = AtomicBool::new(false);
 
 pub struct TestJobHandler;
@@ -55,8 +53,6 @@ impl DurableExecution for TestJobHandler {
     type ErrorData = TestJobErrorData;
     type JobData = TestJobPayload;
 
-    // If not using async_trait, the signature is:
-    // fn process(&self) -> impl std::future::Future<Output = JobResult<Self::Output, Self::ErrorData>> + Send + Sync {
     async fn process(
         &self,
         job: &BorrowedJob<Self::JobData>,

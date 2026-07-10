@@ -698,7 +698,7 @@ impl<H: DurableExecution> MultilaneQueue<H> {
             while jobs_popped < batch_size and empty_lanes_count < total_lanes do
                 local lane_id = lanes_with_scores[lane_index * 2 - 1]
                 
-                -- Skip if we've already marked this lane as empty
+                -- Skip lanes already marked as empty
                 if lane_id == nil then
                     lane_index = lane_index + 1
                     if lane_index > total_lanes then

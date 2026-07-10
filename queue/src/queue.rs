@@ -31,10 +31,11 @@ pub struct QueueOptions {
 
     pub polling_interval: Duration,
 
-    /// If true, always poll for jobs even if there are no available permits
-    /// This is important, because polling is how delayed and timed out jobs are handled
-    /// If you have a horiztonally scaled deployment, this can be set to the default of false
-    /// But if there's only one node, you can set this to true to avoid the local concurrency from blocking queue housekeeping
+    /// If true, always poll for jobs even when no permits are available.
+    /// Polling is also how delayed and timed-out jobs are handled. The default
+    /// of false suits horizontally scaled deployments; in a single-node
+    /// deployment, true prevents local concurrency from blocking queue
+    /// housekeeping.
     pub always_poll: bool,
 
     /// Controls how job idempotency is handled
@@ -185,7 +186,7 @@ impl<H: DurableExecution, R, N, Hn> QueueBuilder<H, R, N, Hn> {
 impl<H: DurableExecution> QueueBuilder<H, HasRedis, HasName, HasHandler> {
     /// Build the Queue (only available when all required fields are set)
     pub async fn build(self) -> Result<Queue<H>, MessageQueueError> {
-        // We can safely unwrap because the typestate guarantees these are Some
+        // Safe to unwrap: the typestate guarantees these are Some
         let redis_source = self.redis_source.unwrap();
         let name = self.name.unwrap();
         let handler = self.handler.unwrap();

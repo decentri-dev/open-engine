@@ -654,7 +654,7 @@ impl<H: DurableExecution> Queue<H> {
                         }
 
                         tracing::trace!("Available permits: {}", available_permits);
-                        // Try to get multiple jobs - as many as we have permits
+                        // Pop as many jobs as there are available permits
                         match queue_clone.pop_batch_jobs(available_permits).await {
                             Ok(jobs) => {
                                 tracing::trace!("Got {} jobs", jobs.len());
@@ -666,7 +666,9 @@ impl<H: DurableExecution> Queue<H> {
 
                                     tokio::spawn(
                                         async move {
-                                        // Process job - note we don't pass a context here
+                                        // Process the job. No transaction context exists at
+                                        // this stage; one is created during completion, where
+                                        // the hooks run.
                                         let result = handler_clone.process(&job).await;
 
                                         // Complete job using unified method with hooks and retry logic
@@ -684,7 +686,7 @@ impl<H: DurableExecution> Queue<H> {
                                 }
                             }
                             Err(e) => {
-                                // No jobs found, we hit an error
+                                // The pop itself failed; back off before retrying.
                                 tracing::error!("Failed to pop batch jobs: {:?}", e);
                                 sleep(Duration::from_millis(1000)).await;
                             }
@@ -860,7 +862,7 @@ impl<H: DurableExecution> Queue<H> {
                 -- Get job data
                 local job_data = redis.call('HGET', job_data_hash_name, job_id)
 
-                -- Only process if we have data
+                -- Only process jobs whose data is present
                 if job_data then
                     -- Update metadata
                     local job_meta_hash_name = 'queue:' .. queue_id .. ':job:' .. job_id .. ':meta'
@@ -958,7 +960,6 @@ impl<H: DurableExecution> Queue<H> {
                     jobs.push(BorrowedJob::new(job, lease_token));
                 }
                 Err(e) => {
-                    // Log error: failed to deserialize job data T for job_id_str
                     tracing::error!(
                         job_id = job_id_str,
                         error = ?e,
@@ -968,7 +969,7 @@ impl<H: DurableExecution> Queue<H> {
                     let queue_clone = self.clone();
 
                     tokio::spawn(async move {
-                        // let's call the on_queue_error hook and move the job to the failed state
+                        // Invoke the on_queue_error hook and move the job to the failed state
                         let mut pipeline = redis::pipe();
                         pipeline.atomic(); // Use MULTI/EXEC
 
@@ -1107,7 +1108,7 @@ impl<H: DurableExecution> Queue<H> {
                 if #job_ids_to_delete > 0 then
                     for _, j_id in ipairs(job_ids_to_delete) do
                         -- CRITICAL FIX: Check if this job_id is currently active/pending/delayed
-                        -- This prevents the race where we prune metadata for a job that's currently running
+                        -- This prevents the race where metadata is pruned for a job that's currently running
                         -- or about to run (pending). LPOS is O(N) but necessary for correctness when
                         -- job IDs are reused (e.g., eoa_address_chainId pattern).
                         local is_active = redis.call('HEXISTS', active_hash, j_id) == 1
@@ -1182,7 +1183,7 @@ impl<H: DurableExecution> Queue<H> {
                 if #job_ids_to_delete > 0 then
                     for _, j_id in ipairs(job_ids_to_delete) do
                         -- CRITICAL FIX: Check if this job_id is currently active/pending/delayed
-                        -- This prevents the race where we prune metadata for a job that's currently running
+                        -- This prevents the race where metadata is pruned for a job that's currently running
                         -- or about to run (pending). LPOS is O(N) but necessary for correctness when
                         -- job IDs are reused (e.g., eoa_address_chainId pattern).
                         local is_active = redis.call('HEXISTS', active_hash, j_id) == 1

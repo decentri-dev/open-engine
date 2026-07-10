@@ -260,7 +260,7 @@ async fn prune_race_condition_two_workers() {
 
     // PHASE 2: Run thousands of iterations to catch the race
     // The race window is: job completes → moves to success → pruning runs
-    // We need a new job with same ID to become active right in that window
+    // A new job with the same ID must become active right in that window
     tracing::warn!("=== PHASE 2: Running iterations to catch the pruning race ===");
 
     let mut iteration = 0;
@@ -290,7 +290,7 @@ async fn prune_race_condition_two_workers() {
         // Very short wait to let the job process
         tokio::time::sleep(Duration::from_millis(5)).await;
 
-        // Check if we caught the race
+        // Check whether the race occurred
         if RACE_DETECTED.load(Ordering::SeqCst) {
             tracing::error!("🎯 RACE CAUGHT AT ITERATION {}!", iteration);
             break;

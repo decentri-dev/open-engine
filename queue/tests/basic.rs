@@ -156,10 +156,8 @@ async fn queue_push_and_process_job() {
 
     println!("Test completed for queue: {}", queue_name.clone());
 
-    // The worker task runs in a loop. For a clean test exit,
-    // you might want to abort it or implement a shutdown signal for the worker.
-    // For this simple test, we'll let it be.
-    worker_handle.shutdown().await.unwrap(); // Or a more graceful shutdown if implemented
+    // Stop the worker loop before cleanup.
+    worker_handle.shutdown().await.unwrap();
 
     // Cleanup Redis keys after test
     cleanup_redis_keys(&queue.redis, &queue_name).await;

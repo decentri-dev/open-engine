@@ -75,10 +75,10 @@ impl DurableExecution for SleepForeverHandler {
             job.job.attempts
         );
 
-        // Signal that we started processing
+        // Signal that processing started
         self.started_processing.store(true, Ordering::SeqCst);
 
-        // Sleep forever (or until test tells us to stop)
+        // Sleep until the test signals shutdown
         while self.should_continue_sleeping.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

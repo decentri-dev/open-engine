@@ -159,7 +159,7 @@ impl MultilaneTestHarness {
 
 impl Drop for MultilaneTestHarness {
     fn drop(&mut self) {
-        // Cleanup in background since we can't await in drop
+        // Cleanup runs in the background since drop can't await
         let queue_id = self.queue_id.clone();
         let redis = self.queue.clone().redis.clone();
 
@@ -203,8 +203,7 @@ async fn multilane_test_batch_pop_single_lane_with_100k_empty_lanes() {
     }
     jobs_per_lane.insert(active_lane.clone(), jobs);
 
-    // Add 99,999 empty lanes by creating them in Redis lanes zset
-    // We do this by adding empty lanes to the zset directly
+    // Add 99,999 empty lanes to the Redis lanes zset directly
     let mut conn = harness.queue.redis.clone();
     for i in 0..99_999 {
         let lane_id = format!("empty_lane_{i}");
