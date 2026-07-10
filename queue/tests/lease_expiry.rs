@@ -273,7 +273,7 @@ async fn job_lease_expiry() {
         job_after_expiry.attempts
     );
 
-    tracing::info!("✅ Lease expiry mechanism works correctly!");
+    tracing::info!("Lease expiry mechanism works correctly!");
     tracing::info!("Job moved from active back to pending after lease expired");
 
     // Stop the sleeping job and cleanup
@@ -296,7 +296,7 @@ async fn multiple_job_lease_expiry() {
     job_started_processing.store(false, Ordering::SeqCst);
     job_should_continue_sleeping.store(true, Ordering::SeqCst);
 
-    tracing::info!("\n=== Testing multiple job lease expiry ===");
+    tracing::info!("Testing multiple job lease expiry");
 
     let queue_options = QueueOptions {
         max_success: 1000,
@@ -378,7 +378,7 @@ async fn multiple_job_lease_expiry() {
     );
     assert_eq!(final_pending, 3, "All jobs should be back in pending");
 
-    tracing::info!("✅ Multiple job lease expiry works correctly!");
+    tracing::info!("Multiple job lease expiry works correctly!");
 
     // Cleanup
     job_should_continue_sleeping.store(false, Ordering::SeqCst);

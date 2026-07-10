@@ -81,8 +81,8 @@ async fn leaves_foreign_paymaster_frame_untouched() {
     let signer = Arc::new(InMemorySigner::new(SPONSOR_KEY).unwrap());
     let compiler = FrameCompiler::new(gateway, signer);
 
-    // Paymaster frame targets a DIFFERENT address -> we must not sign it; the
-    // other party supplies that signature.
+    // Paymaster frame targets a DIFFERENT address -> the compiler must not sign
+    // it; the other party supplies that signature.
     let foreign = "0x9999999999999999999999999999999999999999";
     let compiled = compiler
         .compile_and_validate(sponsored_tx(foreign))

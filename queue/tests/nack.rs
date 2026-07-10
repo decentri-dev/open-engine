@@ -274,7 +274,7 @@ async fn job_retry_attempts() {
         "Job result should show final attempt as {desired_attempts}"
     );
 
-    tracing::info!("✅ Retry mechanism works correctly!");
+    tracing::info!("Retry mechanism works correctly!");
     tracing::info!(
         "Job succeeded on attempt {} as expected",
         job_output.final_attempt
@@ -292,7 +292,7 @@ async fn different_retry_counts() {
     let test_cases = vec![1, 2, 3, 5, 7];
 
     for desired_attempts in test_cases {
-        tracing::info!("\n=== Testing {} attempts ===", desired_attempts);
+        tracing::info!("Testing {} attempts", desired_attempts);
 
         let queue_name = format!("test_retry_{}_{}", desired_attempts, nanoid::nanoid!(4));
         let job_id = format!("retry_job_{desired_attempts}");
@@ -343,8 +343,8 @@ async fn different_retry_counts() {
         worker.shutdown().await.unwrap();
         cleanup_redis_keys(&queue.redis, &queue_name).await;
 
-        tracing::info!("✅ {} attempts test passed", desired_attempts);
+        tracing::info!("{} attempts test passed", desired_attempts);
     }
 
-    tracing::info!("\n✅ All retry count tests passed!");
+    tracing::info!("All retry count tests passed");
 }

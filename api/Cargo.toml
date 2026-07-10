@@ -7,7 +7,6 @@ edition = "2021"
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 open_engine_core = { path = "../core" }
@@ -21,6 +20,3 @@ alloy = { version = "2.0.4", features = ["serde", "signers", "rpc", "transports"
 # transitively via core's alloy KMS features; a default build enables neither.
 signer-aws = ["open_engine_core/signer-aws"]
 signer-gcp = ["open_engine_core/signer-gcp"]
-
-[dev-dependencies]
-tokio = { workspace = true }

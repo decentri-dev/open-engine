@@ -1,6 +1,6 @@
 # Open Engine
 
-The Rust-based transaction handling engine, built from scratch as an additive rewrite. It focuses purely on compiling and broadcasting EIP-8141 Frame Transactions, acting as a high-frequency, reliable transaction broadcaster that manages nonces, gas limits, and paymaster signatures.
+A Rust transaction handling engine focused on compiling and broadcasting EIP-8141 Frame Transactions: a high-frequency, reliable transaction broadcaster that manages nonces, gas limits, and paymaster signatures.
 
 ## Architecture & Modules
 
@@ -24,7 +24,6 @@ The `open-engine` workspace is composed of five primary modules operating synchr
 
 - [Rust & Cargo](https://rustup.rs/) (>= 1.75 is recommended)
 - [Redis](https://redis.io/) (Used as the backing State Machine)
-- Optional: `just` if used similarly as in other parts of the workspace.
 
 ### Running the Engine locally
 
@@ -147,8 +146,8 @@ We use Rust's native test framework for unit and integration testing.
 
 ## Domain Specifics
 
-When modifying the engine, please refer to our internal terminology in `CONTEXT.md`.
+When modifying the engine, please refer to the project glossary in `CONTEXT.md`.
 - **Frame Transaction**: Native EIP-8141 transaction (Type `0x06`).
 - **Compiler**: Modifies and packages frames.
-- **Canonical Paymaster**: A paymaster instance is **canonical** iff the runtime code at the `pay` frame target exactly matches the canonical paymaster implementation (`sources/EIP-8141/EIP-8141.md:711`). Canonical paymasters bypass the generic validation trace/opcode rules and instead use **paymaster-specific accounting and reservation rules** (`sources/EIP-8141/EIP-8141.md:715`).
-- **Non-Canonical Paymaster**: Any paymaster whose runtime code does not exactly match the canonical implementation. In the public mempool, the latest spec limits this by pending transactions **in the mempool using this paymaster**, with `MAX_PENDING_TXS_USING_NON_CANONICAL_PAYMASTER = 1` (`sources/EIP-8141/EIP-8141.md:543`, `sources/EIP-8141/EIP-8141.md:743`).
+- **Canonical Paymaster**: A paymaster instance is **canonical** iff the runtime code at the `pay` frame target exactly matches the canonical paymaster implementation (per the EIP-8141 specification). Canonical paymasters bypass the generic validation trace/opcode rules and instead use **paymaster-specific accounting and reservation rules**.
+- **Non-Canonical Paymaster**: Any paymaster whose runtime code does not exactly match the canonical implementation. In the public mempool, EIP-8141 limits this by pending transactions **in the mempool using this paymaster**, with `MAX_PENDING_TXS_USING_NON_CANONICAL_PAYMASTER = 1`.

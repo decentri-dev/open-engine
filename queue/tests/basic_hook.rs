@@ -288,7 +288,7 @@ async fn cross_queue_job_scheduling() {
         "Webhook job should be in success list"
     );
 
-    println!("✅ Cross-queue job scheduling works!");
+    println!("Cross-queue job scheduling works!");
     println!("Main job triggered webhook job atomically via transaction hooks");
 
     // Cleanup

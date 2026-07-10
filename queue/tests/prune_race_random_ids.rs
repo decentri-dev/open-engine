@@ -163,7 +163,7 @@ async fn prune_with_random_ids() {
         ..Default::default()
     };
 
-    tracing::info!("=== RANDOM ID PRUNING TEST ===");
+    tracing::info!("Random-ID pruning test starting");
     tracing::info!("Queue: {}", queue_name);
     tracing::info!("Max success jobs: {}", queue_options.max_success);
     tracing::info!("Testing pruning behavior with unique random job IDs");
@@ -301,11 +301,11 @@ async fn prune_with_random_ids() {
         .await
         .unwrap_or_else(|_| "N/A".to_string());
 
-    tracing::info!("=== RESULTS ===");
+    tracing::info!("Results:");
     tracing::info!("Total successes: {}", final_success);
     tracing::info!("Total nacks: {}", NACK_COUNT.load(Ordering::SeqCst));
     tracing::info!("");
-    tracing::info!("=== Redis State ===");
+    tracing::info!("Redis state:");
     tracing::info!("Success list length: {}", success_list_len);
     tracing::info!("Pending list length: {}", pending_list_len);
     tracing::info!("Delayed zset length: {}", delayed_zset_len);
@@ -313,13 +313,13 @@ async fn prune_with_random_ids() {
     tracing::info!("Job metadata count: {}", metadata_count);
     tracing::info!("Job data hash entries: {}", job_data_count);
     tracing::info!("");
-    tracing::info!("=== Job IDs (for leak investigation) ===");
+    tracing::info!("Job ID diagnostics:");
     tracing::info!("Success list job IDs: {:?}", success_job_ids);
     tracing::info!("Pending list job IDs: {:?}", pending_jobs);
     tracing::info!("Delayed zset job IDs: {:?}", delayed_jobs);
     tracing::info!("Active hash job IDs: {:?}", active_jobs);
     tracing::info!("");
-    tracing::info!("=== Lua Script Debug Info ===");
+    tracing::info!("Lua script diagnostics:");
     tracing::info!("Candidates to delete (last run): {}", debug_candidates);
     tracing::info!("Active count (at check time): {}", debug_active_count);
     tracing::info!("Delayed count (at check time): {}", debug_delayed_count);
@@ -332,10 +332,10 @@ async fn prune_with_random_ids() {
     tracing::info!("Max success setting: {}", queue.options.max_success);
 
     if success_list_len <= queue.options.max_success {
-        tracing::info!("✅ List pruning is working - success list is within max_success limit");
+        tracing::info!("List pruning is working - success list is within max_success limit");
     } else {
         tracing::warn!(
-            "⚠️  Success list ({}) exceeds max_success ({})",
+            "Success list ({}) exceeds max_success ({})",
             success_list_len,
             queue.options.max_success
         );
@@ -343,9 +343,9 @@ async fn prune_with_random_ids() {
     }
 
     if metadata_count == success_list_len {
-        tracing::info!("✅ Metadata cleanup is working - metadata count matches list length");
+        tracing::info!("Metadata cleanup is working - metadata count matches list length");
     } else {
-        tracing::warn!("⚠️  Metadata leak detected!");
+        tracing::warn!("Metadata leak detected!");
         tracing::warn!(
             "   Job metadata hashes: {}, Success list length: {}",
             metadata_count,

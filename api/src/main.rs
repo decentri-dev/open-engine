@@ -97,8 +97,8 @@ fn job_id_for(sender: &str, nonce_keys_repr: &str, nonce_seq: u64) -> String {
 ///
 /// Both the fee cap and the priority fee must rise by at least ~10%, matching
 /// the replacement rule public nodes enforce. The threshold is rounded up, so
-/// we never accept a bump the node would reject (conservative: over-reject, not
-/// under-reject).
+/// the engine never accepts a bump the node would reject (conservative:
+/// over-reject, not under-reject).
 fn is_valid_fee_bump(existing: &FrameTransaction, incoming: &FrameTransaction) -> bool {
     fn bumped(old: Option<u128>, new: Option<u128>) -> bool {
         match (old, new) {

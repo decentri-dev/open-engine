@@ -71,7 +71,7 @@ impl<G: ChainGateway + Send + Sync> MempoolBroadcaster<G> {
                     BroadcasterError(format!("Failed to fetch keyed nonce from RPC: {e}"))
                 })?;
             if seq < current {
-                // This key already advanced past our sequence: never valid again.
+                // This key already advanced past the transaction's sequence: never valid again.
                 superseded = true;
             }
             if seq != current {
@@ -150,9 +150,9 @@ impl<G: ChainGateway + Send + Sync + 'static> DurableExecution for MempoolBroadc
             "Frame transaction selected for broadcast"
         );
 
-        // 1. Keyed nonce reconciliation (EIP-8250). We cannot patch nonce_seq —
-        //    it is covered by the canonical hash — so we only decide whether the
-        //    transaction is executable now, must wait, or is superseded.
+        // 1. Keyed nonce reconciliation (EIP-8250). nonce_seq cannot be patched —
+        //    it is covered by the canonical hash — so the broadcaster only decides
+        //    whether the transaction is executable now, must wait, or is superseded.
         let seq = tx_data.nonce_seq.ok_or_else(|| {
             error!(
                 job_id = %job.id(),
@@ -167,7 +167,7 @@ impl<G: ChainGateway + Send + Sync + 'static> DurableExecution for MempoolBroadc
         let seq_state = match self.resolve_seq_state(sender, tx_data, seq).await {
             Ok(state) => state,
             Err(e) => {
-                // If RPC fails, we NACK the job so it retries later.
+                // If RPC fails, NACK the job so it retries later.
                 warn!(
                     job_id = %job.id(),
                     sender = %sender,
@@ -197,8 +197,8 @@ impl<G: ChainGateway + Send + Sync + 'static> DurableExecution for MempoolBroadc
             SeqState::Future => {
                 // Not yet executable. The public mempool only holds one pending
                 // frame tx per (sender, key), so broadcasting a future-sequence tx
-                // now would just be rejected or shelved by the node. Instead we
-                // keep it in our own private, sequence-ordered slot and retry once
+                // now would just be rejected or shelved by the node. Instead the
+                // broadcaster keeps it in a private, sequence-ordered slot and retries once
                 // the predecessor lands — bounded by a wall-clock deadline so a
                 // predecessor that never arrives cannot pin the slot.
                 let now = SystemTime::now()
@@ -247,7 +247,7 @@ impl<G: ChainGateway + Send + Sync + 'static> DurableExecution for MempoolBroadc
         }
 
         // 2. Network Broadcast
-        // Here we RLP-encode the FrameTransaction and send it via the Gateway.
+        // RLP-encode the FrameTransaction and send it via the Gateway.
         // Defense in depth: the compiler validates the wire format at intake,
         // but queued job data may predate that check or have been corrupted —
         // and the RLP encoder itself cannot fail, it would silently encode

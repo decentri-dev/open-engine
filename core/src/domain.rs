@@ -9,13 +9,13 @@ pub const FRAME_TX_PER_FRAME_COST: u64 = 475;
 /// in block execution or consensus, so it can move without touching the state
 /// transition.
 ///
-/// The spec's canonical value is 100_000, but the network we broadcast to
-/// currently admits up to 500_000 so a validation prefix can run a heavier
-/// proof-verification VERIFY frame while the real envelope and signature
-/// overhead is being benchmarked. We mirror the admission budget: a stricter
-/// local value would reject transactions the node accepts, a looser one would
-/// queue transactions the node rejects. Revisit when the canonical value
-/// settles.
+/// The spec's canonical value is 100_000, but the ethrex reference devnet this
+/// engine targets currently admits up to 500_000 so a validation prefix can
+/// run a heavier proof-verification VERIFY frame. The engine mirrors the
+/// node's admission budget: a stricter local value would reject transactions
+/// the node accepts, a looser one would queue transactions the node rejects.
+/// Update this constant if the deployment targets a node with a different
+/// admission budget, or when the spec's canonical value settles.
 pub const MAX_VERIFY_GAS: u64 = 500_000;
 pub const FRAME_TX_MAX_FRAMES: usize = 64;
 pub const EXPIRY_VERIFIER_ADDRESS: &str = "0x0000000000000000000000000000000000008141";

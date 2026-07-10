@@ -275,7 +275,7 @@ async fn job_delay_basic() {
         "Actual delay ({actual_delay}) should be close to expected delay ({expected_delay})"
     );
 
-    tracing::info!("✅ Basic delay mechanism works correctly!");
+    tracing::info!("Basic delay mechanism works correctly!");
 
     worker.shutdown().await.unwrap();
     cleanup_redis_keys(&redis_conn, &queue_name).await;
@@ -295,7 +295,7 @@ async fn delay_position_ordering() {
     let queue_name = format!("test_delay_order_{test_id}");
 
     tracing::info!(
-        "\n=== Testing delay position ordering (test_id: {}) ===",
+        "Testing delay position ordering (test_id: {})",
         test_id
     );
 
@@ -436,7 +436,7 @@ async fn delay_position_ordering() {
         "Delayed job with Last position should process last"
     );
 
-    tracing::info!("✅ Delay position ordering works correctly!");
+    tracing::info!("Delay position ordering works correctly!");
 
     worker.shutdown().await.unwrap();
     cleanup_redis_keys(&redis_conn, &queue_name).await;

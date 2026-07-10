@@ -37,7 +37,7 @@ fn to_frame_signature(signature: alloy::primitives::Signature) -> Bytes {
     Bytes::from(vrs)
 }
 
-/// Adapts any alloy [`Signer`](AlloySigner) into our [`Signer`] trait.
+/// Adapts any alloy [`Signer`](AlloySigner) into this crate's [`Signer`] trait.
 ///
 /// This is the single place the `r||s||v` → `v||r||s` re-encoding lives, so
 /// every backend (in-memory key, AWS KMS, GCP KMS) shares identical output

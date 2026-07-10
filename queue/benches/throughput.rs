@@ -72,13 +72,6 @@ impl BenchmarkMetrics {
         }
     }
 
-    // fn reset(&self) {
-    //     self.jobs_processed.store(0, Ordering::SeqCst);
-    //     self.jobs_nacked.store(0, Ordering::SeqCst);
-    //     self.jobs_succeeded.store(0, Ordering::SeqCst);
-    //     self.total_processing_time_ms.store(0, Ordering::SeqCst);
-    // }
-
     fn processed_count(&self) -> u64 {
         self.jobs_processed.load(Ordering::SeqCst)
     }

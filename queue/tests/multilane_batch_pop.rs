@@ -244,7 +244,7 @@ async fn multilane_test_batch_pop_single_lane_with_100k_empty_lanes() {
         .expect("Batch pop should complete within 10 seconds");
 
     let duration = start.elapsed();
-    println!("✅ Batch pop completed in {duration:?}");
+    println!("Batch pop completed in {duration:?}");
 
     // Verify results
     assert_eq!(result.len(), 1, "Should get jobs from exactly 1 lane");
@@ -275,7 +275,7 @@ async fn multilane_test_batch_pop_single_lane_with_100k_empty_lanes() {
         "Should complete within 5 seconds even with 100k lanes"
     );
 
-    println!("✅ Test passed: Single lane with 100k empty lanes");
+    println!("Test passed: Single lane with 100k empty lanes");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -326,7 +326,7 @@ async fn multilane_test_batch_pop_distributed_jobs_across_100k_lanes() {
         .await
         .expect("First batch pop should complete within 10 seconds");
     let duration1 = start.elapsed();
-    println!("[200 jobs - 200/100k lanes] ✅ First batch pop completed in {duration1:?}");
+    println!("[200 jobs - 200/100k lanes] First batch pop completed in {duration1:?}");
 
     let new_lanes_count = harness.queue.lanes_count().await.unwrap();
     println!(
@@ -352,7 +352,7 @@ async fn multilane_test_batch_pop_distributed_jobs_across_100k_lanes() {
         .await
         .expect("Second batch pop should complete within 10 seconds");
     let duration2 = start.elapsed();
-    println!("[200 jobs - 200/100k lanes] ✅ Second batch pop completed in {duration2:?}");
+    println!("[200 jobs - 200/100k lanes] Second batch pop completed in {duration2:?}");
 
     let total_jobs_2: usize = result2.values().map(|jobs| jobs.len()).sum();
     assert_eq!(total_jobs_2, 100, "Second batch should return 100 jobs");
@@ -373,7 +373,7 @@ async fn multilane_test_batch_pop_distributed_jobs_across_100k_lanes() {
         .await
         .expect("Third batch pop should complete within 10 seconds");
     let duration3 = start.elapsed();
-    println!("✅ Third batch pop completed in {duration3:?}");
+    println!("Third batch pop completed in {duration3:?}");
 
     let total_jobs_3: usize = result3.values().map(|jobs| jobs.len()).sum();
     assert_eq!(total_jobs_3, 0, "Third batch should return 0 jobs");
@@ -408,7 +408,7 @@ async fn multilane_test_batch_pop_distributed_jobs_across_100k_lanes() {
         "Third batch should complete very quickly (no jobs)"
     );
 
-    println!("✅ Test passed: Distributed jobs across 100k lanes");
+    println!("Test passed: Distributed jobs across 100k lanes");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -458,7 +458,7 @@ async fn multilane_test_batch_pop_fairness_across_lanes() {
         .await;
     assert_eq!(remaining, 90, "Should have 90 jobs remaining");
 
-    println!("✅ Test passed: Fairness across multiple lanes");
+    println!("Test passed: Fairness across multiple lanes");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -478,5 +478,5 @@ async fn multilane_test_batch_pop_empty_queue() {
         .await;
     assert_eq!(pending, 0, "Should have no pending jobs");
 
-    println!("✅ Test passed: Empty queue handling");
+    println!("Test passed: Empty queue handling");
 }

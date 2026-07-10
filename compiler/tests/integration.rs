@@ -81,10 +81,10 @@ async fn compiles_and_queues_self_relay_tx() {
     assert!(result.is_ok(), "Broadcasting failed: {:?}", result.err());
     let tx_hash = result.unwrap();
 
-    // Verify the tx hash matches our mock
+    // Verify the tx hash matches the mock gateway's hash
     assert_eq!(tx_hash, B256::repeat_byte(0xaa).to_string());
 
-    println!("Vertical slice successful! Tx Hash: {}", tx_hash);
+    println!("Self-relay compile -> queue -> broadcast flow succeeded. Tx Hash: {}", tx_hash);
 }
 
 #[tokio::test]
@@ -103,7 +103,7 @@ async fn compiles_and_queues_sponsored_tx() {
     let broadcaster = MempoolBroadcaster::new(gateway.clone());
 
     // 2. Create a Sponsored Transaction. The paymaster frame must target the
-    //    account our signer controls — the compiler only signs a sponsor frame
+    //    account the test signer controls — the compiler only signs a sponsor frame
     //    whose target matches its own address (the self-check).
     let sender = DUMMY_SENDER.to_string();
     let paymaster = format!("{:#x}", sponsor_signer.address());

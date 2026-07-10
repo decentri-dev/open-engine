@@ -189,7 +189,7 @@ async fn prune_race_condition_two_workers() {
         ..Default::default()
     };
 
-    tracing::warn!("=== TWO WORKER RACE TEST ===");
+    tracing::info!("Two-worker race test starting");
     tracing::warn!("Queue: {}", queue_name);
     tracing::warn!("Max success jobs: {}", queue_options.max_success);
     tracing::warn!(
@@ -242,7 +242,7 @@ async fn prune_race_condition_two_workers() {
     tracing::warn!("Two workers started!");
 
     // PHASE 1: Create one successful job to fill success list
-    tracing::warn!("=== PHASE 1: Creating initial success ===");
+    tracing::info!("Phase 1: creating initial success");
     SHOULD_NACK.store(false, Ordering::SeqCst);
     PROCESS_SLOWLY.store(false, Ordering::SeqCst);
 
@@ -261,7 +261,7 @@ async fn prune_race_condition_two_workers() {
     // PHASE 2: Run thousands of iterations to catch the race
     // The race window is: job completes → moves to success → pruning runs
     // A new job with the same ID must become active right in that window
-    tracing::warn!("=== PHASE 2: Running iterations to catch the pruning race ===");
+    tracing::info!("Phase 2: running iterations to catch the pruning race");
 
     let mut iteration = 0;
     let max_iterations = 10000;
@@ -292,7 +292,7 @@ async fn prune_race_condition_two_workers() {
 
         // Check whether the race occurred
         if RACE_DETECTED.load(Ordering::SeqCst) {
-            tracing::error!("🎯 RACE CAUGHT AT ITERATION {}!", iteration);
+            tracing::error!("Race caught at iteration {}", iteration);
             break;
         }
     }
@@ -301,7 +301,7 @@ async fn prune_race_condition_two_workers() {
 
     let final_race_detected = RACE_DETECTED.load(Ordering::SeqCst);
 
-    tracing::warn!("=== RESULTS ===");
+    tracing::info!("Results:");
     tracing::warn!("Race detected: {}", final_race_detected);
     tracing::warn!("Total successes: {}", SUCCESS_COUNT.load(Ordering::SeqCst));
     tracing::warn!("Total nacks: {}", NACK_COUNT.load(Ordering::SeqCst));
@@ -312,7 +312,7 @@ async fn prune_race_condition_two_workers() {
 
     if final_race_detected {
         tracing::error!(
-            "⚠️  UNEXPECTED: Race condition detected after {} iterations!",
+            "UNEXPECTED: race condition detected after {} iterations!",
             iteration
         );
         tracing::error!("   This should NOT happen with the fix in place!");
@@ -320,7 +320,7 @@ async fn prune_race_condition_two_workers() {
         panic!("Race condition detected - the fix is not working properly!");
     } else {
         tracing::info!(
-            "✅ SUCCESS: No race detected after {} iterations",
+            "No race detected after {} iterations",
             iteration
         );
         tracing::info!("   The fix is working correctly!");

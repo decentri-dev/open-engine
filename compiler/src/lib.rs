@@ -63,7 +63,7 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
 
         // 2. Sponsorship Injection
         // In EIP-8141, the client pre-allocates the VERIFY frame for the paymaster.
-        // We find the VERIFY frame belonging to the sponsor and inject our signature.
+        // Find the VERIFY frame belonging to the sponsor and inject the sponsor signature.
         // This must precede the preflight: the node executes the real VERIFY
         // frames, so a sponsored prefix only passes once the signature is in place.
         self.inject_sponsor_signature(&mut tx).await?;
@@ -112,8 +112,8 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
             )));
         }
 
-        // EIP-8250: keyed nonce validity (mirrors the decoder rules). We validate
-        // the effective keys, so an omitted list is treated as the legacy [0].
+        // EIP-8250: keyed nonce validity (mirrors the decoder rules). The check
+        // runs on the effective keys, so an omitted list is treated as the legacy [0].
         let nonce_keys = tx.effective_nonce_keys();
         if nonce_keys.len() > FRAME_TX_MAX_NONCE_KEYS {
             return Err(CompilerError::Validation(format!(
@@ -430,8 +430,8 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
             }
         }
 
-        // Conformance cross-check: our locally-computed max_cost must match the
-        // node's. A mismatch means our wire encoding or gas formula has drifted
+        // Conformance cross-check: the locally-computed max_cost must match the
+        // node's. A mismatch means the local wire encoding or gas formula has drifted
         // from the node's — the same class of silent bug that the missing
         // `recent_root_references` field caused. Warn rather than reject, since
         // the node's value is authoritative and this is a drift alarm.
@@ -455,30 +455,30 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
 
     /// Signs the paymaster VERIFY frame that this signer owns, if present.
     ///
-    /// The sponsor frame is identified by its target matching **our own signer
-    /// address** — not merely "any non-sender VERIFY frame". A VERIFY frame
+    /// The sponsor frame is identified by its target matching **this compiler's
+    /// signer address** — not merely "any non-sender VERIFY frame". A VERIFY frame
     /// pointing at some other address is a foreign paymaster arrangement whose
-    /// signature that party supplies; we must never attach our sponsor signature
-    /// to a frame we do not control. Before signing, the sponsor policy is
+    /// signature that party supplies; the sponsor signature must never be attached
+    /// to a frame outside this signer's control. Before signing, the sponsor policy is
     /// consulted (spend ceiling, allowlist, quota) since sponsoring makes this
     /// signer the payer.
     async fn inject_sponsor_signature(
         &self,
         tx: &mut FrameTransaction,
     ) -> Result<(), CompilerError> {
-        // Our sponsor identity — the account whose key we hold. Lowercased hex
-        // (`0x…`) so it compares case-insensitively with a frame target.
-        let our_address = format!("{:#x}", self.sponsor_signer.address());
+        // The sponsor identity: the account whose key this compiler holds.
+        // Lowercased hex (`0x…`) so it compares case-insensitively with a frame target.
+        let sponsor_address = format!("{:#x}", self.sponsor_signer.address());
 
         let sponsor_frame_index = tx.frames.iter().position(|frame| {
             let target = frame.target.as_deref().unwrap_or("").to_lowercase();
             let is_expiry_verifier = target == EXPIRY_VERIFIER_ADDRESS.to_lowercase();
-            matches!(frame.mode, FrameMode::Verify) && !is_expiry_verifier && target == our_address
+            matches!(frame.mode, FrameMode::Verify) && !is_expiry_verifier && target == sponsor_address
         });
 
         let Some(index) = sponsor_frame_index else {
             info!(
-                "No sponsor VERIFY frame targets this signer ({our_address}); treating as self-relay or foreign sponsorship."
+                "No sponsor VERIFY frame targets this signer ({sponsor_address}); treating as self-relay or foreign sponsorship."
             );
             return Ok(());
         };
@@ -487,7 +487,7 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
             "Found sponsor VERIFY frame at index {index} targeting this signer; enforcing policy before signing."
         );
 
-        // Sponsoring makes us the payer, so guard sponsor spend BEFORE signing.
+        // Sponsoring makes this signer the payer, so guard sponsor spend BEFORE signing.
         self.policy
             .check(tx)
             .await
@@ -502,19 +502,19 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
             .await
             .map_err(|e| CompilerError::Signing(e.to_string()))?;
 
-        // Fill the existing placeholder entry (matched by our address) rather
+        // Fill the existing placeholder entry (matched by the sponsor address) rather
         // than pushing a new one, so the RLP signature list — and thus the
         // canonical hash — is unchanged.
         let sponsor_sig = tx
             .signatures
             .iter_mut()
-            .find(|sig| sig.signer.to_lowercase() == our_address);
+            .find(|sig| sig.signer.to_lowercase() == sponsor_address);
 
         match sponsor_sig {
             Some(sponsor_sig) => sponsor_sig.signature = alloy::hex::encode(signature),
             None => {
                 return Err(CompilerError::Signing(format!(
-                    "sponsor signature entry for {our_address} is missing; the transaction must pre-allocate the signature placeholder so the canonical hash is stable"
+                    "sponsor signature entry for {sponsor_address} is missing; the transaction must pre-allocate the signature placeholder so the canonical hash is stable"
                 )))
             }
         }

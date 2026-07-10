@@ -166,8 +166,8 @@ impl ChainGateway for AlloyGateway {
         tx: &crate::domain::FrameTransaction,
     ) -> Result<FrameSimulation, GatewayError> {
         // The node takes the canonical wire bytes (the exact encoding
-        // `eth_sendRawTransaction` receives) plus an optional block, which we
-        // omit to simulate against latest.
+        // `eth_sendRawTransaction` receives) plus an optional block, omitted
+        // here to simulate against latest.
         let raw = crate::encoding::Eip8141Encoder::encode_transaction(tx);
 
         let result: Option<FrameSimulation> = self
@@ -189,7 +189,7 @@ impl ChainGateway for AlloyGateway {
             })?;
 
         // The node answers `null` only when the requested block is unknown;
-        // we always simulate against latest, so surface it as an RPC failure.
+        // simulation always runs against latest, so surface it as an RPC failure.
         result.ok_or_else(|| {
             GatewayError::RpcError(
                 "ethrex_simulateFrameTransaction returned null (block not found)".to_string(),
@@ -198,8 +198,9 @@ impl ChainGateway for AlloyGateway {
     }
 
     async fn send_raw_transaction(&self, bytes: Bytes) -> Result<B256, GatewayError> {
-        // Alloy doesn't expose send_raw_transaction directly with arbitrary bytes on the root provider easily without building a tx envelope,
-        // but we can send it as raw bytes using the raw RPC client.
+        // Alloy doesn't expose send_raw_transaction with arbitrary bytes on the
+        // root provider without building a tx envelope, so the raw RPC client
+        // sends the bytes directly.
         let hash = self
             .provider
             .client()
@@ -282,7 +283,7 @@ mod tests {
         let _p: RootProvider<Ethereum> = RootProvider::new_http(url);
     }
 
-    /// Live round-trip of `simulate_frame_transaction`: our canonical encoding
+    /// Live round-trip of `simulate_frame_transaction`: the engine's canonical encoding
     /// must be accepted by the node's decoder and the node's response must
     /// deserialize into [`FrameSimulation`]. Whether the transaction is
     /// actually valid depends on devnet state (sender code, nonce, balances),
@@ -332,7 +333,7 @@ mod tests {
             .expect("simulation RPC failed");
 
         // max_cost is a pure function of the tx fields and is reported on
-        // every path, so it proves the node decoded OUR bytes as a frame tx.
+        // every path, so it proves the node decoded these exact bytes as a frame tx.
         assert!(sim.max_cost > U256::ZERO, "max_cost should be non-zero");
         println!(
             "round-trip ok: valid={} prefix_shape={:?} violation={:?} gas_used={:?}",
