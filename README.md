@@ -80,7 +80,7 @@ Policy guards (all optional in `gated`, required as noted in `public`):
 | `SPONSOR_MAX_COST_WEI` | Per-transaction ceiling on the sponsor's `max_cost` exposure. |
 | `SPONSOR_SENDER_ALLOWLIST` | Comma-separated addresses; only these senders may be sponsored. |
 | `SPONSOR_PER_SENDER_MAX_COST_PER_WINDOW` + `SPONSOR_QUOTA_WINDOW_SECS` | Redis-backed per-sender windowed spend quota. |
-| `SPONSOR_GLOBAL_BUDGET_WEI` | Redis-backed cumulative sponsor budget. |
+| `SPONSOR_GLOBAL_BUDGET_WEI` + `SPONSOR_BUDGET_WINDOW_SECS` | Redis-backed cap on aggregate sponsor spend per window (self-healing; window defaults to `SPONSOR_QUOTA_WINDOW_SECS`). |
 
 In `public` mode, boot aborts unless the policy sets a spend bound (ceiling or
 budget) **and** an admission bound (allowlist or per-sender quota). The compiler
@@ -126,9 +126,60 @@ curl -X POST http://localhost:3001/transaction \
 }'
 ```
 
+### Tracking a Frame Transaction
+
+`POST /transaction` returns a `jobId` identifying the `(sender, nonce_keys, nonce_seq)` slot. Poll it for the transaction's progress:
+
+```bash
+curl http://localhost:3001/transaction/0x1111111111111111111111111111111111111111:0:42
+```
+
+```json
+{
+  "jobId": "0x1111111111111111111111111111111111111111:0:42",
+  "status": "broadcast",
+  "attempts": 1,
+  "createdAt": 1718291024,
+  "processedAt": 1718291025,
+  "finishedAt": 1718291026,
+  "txHash": "0xabc…"
+}
+```
+
+`status` is one of:
+
+| Status | Meaning |
+| --- | --- |
+| `pending` | Queued, not yet picked up by a worker. |
+| `waitingForNonce` | Valid, but a selected key's predecessor sequence has not landed on-chain. Held and re-checked; `retryAfter` gives the next check. Bounded by `MAX_NONCE_HOLD_SECS` (300s), after which the job fails. |
+| `retrying` | An attempt failed and the job is backing off. `reason` carries the last error, `retryAfter` the next attempt. |
+| `broadcasting` | A worker holds a lease and is broadcasting now. |
+| `broadcast` | The node accepted the raw transaction and returned `txHash`. **Terminal.** |
+| `superseded` | A selected key advanced past `nonce_seq`, so the transaction can never be valid. Dropped without being sent. **Terminal.** |
+| `failed` | Permanently rejected or cancelled; `reason` says why. **Terminal.** |
+
+Other fields:
+
+- **`reason`** — one line explaining the current status. Present when the status word alone does not say it; absent otherwise.
+- **`txHash`** — present only on `broadcast`. For a sponsored transaction the client *cannot* derive this itself: the sponsor signature is injected server-side after the client signs, so the final hash only exists here.
+- **`retryAfter`** — epoch seconds at which a held or backing-off job next runs.
+- **`failedAttempts`** — the attempts that errored, newest first, each with `attempt`, `at`, `outcome` (`retry` or `terminal`), `message`, and `retryDelaySecs`. Retained for a job that later succeeded, so a flaky RPC endpoint stays visible. Bounded: the queue keeps `max_job_errors` records (default 50) and the response returns at most 20, while `attempts` remains the true count.
+
+`404` means the job is unknown *or* has been pruned — the engine cannot distinguish the two. Finished jobs are retained for the last 1000 successes and 10000 failures.
+
+**`broadcast` is not confirmation.** The engine hands off at the mempool and never watches for a receipt. Take `txHash` to an RPC node and call `eth_getTransactionReceipt` for inclusion.
+
+Job ids are not permanently unique. A slot becomes re-pushable once its previous job is pruned, and a re-push starts clean — the earlier run's result and history are discarded.
+
 ## Running Tests
 
 We use Rust's native test framework for unit and integration testing.
+
+The `queue` suite and the API's HTTP tests exercise real Redis on `127.0.0.1:6379`, so start one first:
+
+```bash
+docker run --rm -p 6379:6379 redis:7-alpine
+```
 
 - **Run all tests**:
   ```bash

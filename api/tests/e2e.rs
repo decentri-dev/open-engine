@@ -3,7 +3,7 @@ use broadcaster::worker::MempoolBroadcaster;
 use compiler::FrameCompiler;
 use open_engine_core::domain::{Frame, FrameMode, FrameSignature, FrameTransaction};
 use open_engine_core::encoding::Eip8141Encoder;
-use open_engine_core::gateway::AlloyGateway;
+use open_engine_core::gateway::{AlloyGateway, ChainGateway};
 use open_engine_core::signer::{InMemorySigner, Signer};
 use queue::Queue;
 use std::sync::Arc;
@@ -18,9 +18,13 @@ async fn end_to_end_flow() {
     // 1. Setup local environment variables
     let redis_url = "redis://127.0.0.1:6379/";
     let rpc_url = "http://127.0.0.1:8545"; // Local EIP-8141 devnet node
-    // Standard dev key; the derived sender must be funded in the devnet genesis.
-    let private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-    let sender: Address = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+    // The sender must be an account funded in the devnet genesis, since it is its
+    // own payer here (no paymaster): the node charges this account's balance for
+    // the transaction's max_cost while executing the validation prefix, so an
+    // unfunded sender reverts the prefix. This key derives the funded genesis
+    // account 0x8dAe2709… (see eip-8141-local-genesis.json `alloc`).
+    let private_key = "0x70edad00d375135e138d5e9ca8afd74961af7c9b734e6ebf165cbae9e04466c2";
+    let sender: Address = "0x8dAe27091881819fc2951a1a788899487a9c8B17"
         .parse()
         .unwrap();
 
@@ -39,11 +43,21 @@ async fn end_to_end_flow() {
     // 4. Start the Worker (Broadcaster)
     let worker = queue.clone().work();
 
+    // 4.5. Resolve the sender's live executable sequence for the legacy nonce key
+    // (key 0). This is a long-running devnet, so the account has already sent
+    // transactions; hardcoding 0 would be rejected by the preflight as behind the
+    // current sequence. `nonce_seq` is part of the signed hash, so it must be
+    // fixed before signing below.
+    let nonce_seq = gateway
+        .get_keyed_nonce_seq(sender, alloy::primitives::U256::ZERO)
+        .await
+        .expect("failed to read sender sequence");
+
     // 5. Create a FrameTransaction Intent (Simulating what the API layer would do)
     let mut frame_tx = FrameTransaction {
         chain_id: DEVNET_CHAIN_ID,
         nonce_keys: vec![alloy::primitives::U256::ZERO], // Legacy account-nonce domain
-        nonce_seq: Some(0), // Must be the sender's executable sequence (fresh account = 0)
+        nonce_seq: Some(nonce_seq), // The sender's current executable sequence
         sender: sender.to_string(),
         max_priority_fee_per_gas: Some(1_000_000_000),
         max_fee_per_gas: Some(2_000_000_000),

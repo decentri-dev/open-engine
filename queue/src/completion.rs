@@ -37,6 +37,17 @@ pub(crate) struct CompletionKeys {
     pub job_errors_list: String,
     pub dedupe_set: String,
     pub idempotency_mode: IdempotencyMode,
+    pub max_job_errors: usize,
+}
+
+/// Append an error record, keeping only the most recent `max_job_errors`.
+///
+/// Nothing caps how many times a job may be retried, so the trim is what stops
+/// a job that fails forever from accumulating an unbounded list. Records are
+/// pushed newest-first, so the trim always drops the oldest.
+fn add_error_record(pipe: &mut Pipeline, k: &CompletionKeys, error_json: &str) {
+    pipe.lpush(&k.job_errors_list, error_json)
+        .ltrim(&k.job_errors_list, 0, k.max_job_errors as isize - 1);
 }
 
 fn now_secs() -> u64 {
@@ -69,12 +80,15 @@ fn add_nack_ops(
 ) {
     pipe.del(&k.lease_key)
         .hdel(&k.active_hash, job_id)
-        .hdel(&k.job_meta_hash, "lease_token")
-        .lpush(&k.job_errors_list, error_json);
+        .hdel(&k.job_meta_hash, "lease_token");
+    add_error_record(pipe, k, error_json);
 
     if let Some(delay) = delay {
         let delay_until = now + delay_to_queue_seconds(delay);
+        // `retry_at` marks the job as backing off rather than runnable. The pop
+        // clears it, so it is only ever set while the job is genuinely waiting.
         pipe.hset(&k.job_meta_hash, "reentry_position", position.to_string())
+            .hset(&k.job_meta_hash, "retry_at", delay_until)
             .zadd(&k.delayed_zset, job_id, delay_until);
     } else {
         match position {
@@ -93,8 +107,8 @@ fn add_fail_ops(pipe: &mut Pipeline, k: &CompletionKeys, job_id: &str, error_jso
         .hdel(&k.active_hash, job_id)
         .lpush(&k.failed_list, job_id)
         .hset(&k.job_meta_hash, "finished_at", now)
-        .hdel(&k.job_meta_hash, "lease_token")
-        .lpush(&k.job_errors_list, error_json);
+        .hdel(&k.job_meta_hash, "lease_token");
+    add_error_record(pipe, k, error_json);
     if k.idempotency_mode == IdempotencyMode::Active {
         pipe.srem(&k.dedupe_set, job_id);
     }
@@ -116,7 +130,11 @@ fn add_defer_ops(
         .hincr(&k.job_meta_hash, "attempts", -1);
 
     let delay_until = now + delay_to_queue_seconds(delay);
+    // `deferred_until` is the benign-hold counterpart of `retry_at`: it records
+    // that the job is waiting on a precondition, not recovering from a failure,
+    // so a status reader can tell the two apart. The pop clears it.
     pipe.hset(&k.job_meta_hash, "reentry_position", position.to_string())
+        .hset(&k.job_meta_hash, "deferred_until", delay_until)
         .zadd(&k.delayed_zset, job_id, delay_until);
 }
 

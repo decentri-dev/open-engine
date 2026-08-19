@@ -132,13 +132,12 @@ impl SponsorPolicy {
         }
     }
 
-    /// Evaluates every configured guard for `tx`. Stateless guards first (cheap,
-    /// no I/O), then the stateful store which atomically reserves the spend.
-    pub async fn check(&self, tx: &FrameTransaction) -> Result<(), PolicyError> {
-        let sender: Address = tx
-            .sender
-            .parse()
-            .map_err(|_| PolicyError::InvalidSender(tx.sender.clone()))?;
+    /// Evaluates the stateless guards (sender allowlist, per-transaction spend
+    /// ceiling). These are pure and reserve nothing, so the compiler runs them
+    /// *before* signing and preflight: a request that fails here never receives a
+    /// sponsor signature and never reaches the node.
+    pub fn check_stateless(&self, tx: &FrameTransaction) -> Result<(), PolicyError> {
+        let sender = parse_sender(tx)?;
 
         if let Some(allowlist) = &self.sender_allowlist {
             if !allowlist.contains(&sender) {
@@ -146,19 +145,35 @@ impl SponsorPolicy {
             }
         }
 
-        let max_cost = tx.max_cost();
         if let Some(ceiling) = self.max_cost_wei {
+            let max_cost = tx.max_cost();
             if max_cost > ceiling {
                 return Err(PolicyError::MaxCostExceeded { max_cost, ceiling });
             }
         }
 
-        if let Some(store) = &self.store {
-            store.try_reserve(sender, max_cost).await?;
-        }
-
         Ok(())
     }
+
+    /// Atomically reserves this transaction's `max_cost` against the stateful
+    /// guards (per-sender windowed quota, global budget). The reservation commits
+    /// and has no refund path, so the compiler defers it until *after* a
+    /// successful preflight — a transaction the node would reject must not consume
+    /// the irreversible budget or quota. A no-op when no store is configured.
+    pub async fn reserve(&self, tx: &FrameTransaction) -> Result<(), PolicyError> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        store.try_reserve(parse_sender(tx)?, tx.max_cost()).await
+    }
+}
+
+/// Parses the transaction's sender into an [`Address`], mapping a malformed value
+/// to [`PolicyError::InvalidSender`].
+fn parse_sender(tx: &FrameTransaction) -> Result<Address, PolicyError> {
+    tx.sender
+        .parse()
+        .map_err(|_| PolicyError::InvalidSender(tx.sender.clone()))
 }
 
 #[cfg(test)]
@@ -191,14 +206,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn permissive_passes_everything() {
+    #[test]
+    fn permissive_passes_everything() {
         let policy = SponsorPolicy::permissive();
-        assert!(policy.check(&tx_with_fee(1_000_000_000)).await.is_ok());
+        assert!(policy.check_stateless(&tx_with_fee(1_000_000_000)).is_ok());
     }
 
-    #[tokio::test]
-    async fn ceiling_rejects_over_cap() {
+    #[test]
+    fn ceiling_rejects_over_cap() {
         let tx = tx_with_fee(1_000_000_000);
         let cost = tx.max_cost();
 
@@ -206,20 +221,20 @@ mod tests {
             max_cost_wei: Some(cost),
             ..Default::default()
         };
-        assert!(ok.check(&tx).await.is_ok(), "cost == ceiling must pass");
+        assert!(ok.check_stateless(&tx).is_ok(), "cost == ceiling must pass");
 
         let reject = SponsorPolicy {
             max_cost_wei: Some(cost - U256::from(1)),
             ..Default::default()
         };
         assert!(matches!(
-            reject.check(&tx).await,
+            reject.check_stateless(&tx),
             Err(PolicyError::MaxCostExceeded { .. })
         ));
     }
 
-    #[tokio::test]
-    async fn allowlist_gates_sender() {
+    #[test]
+    fn allowlist_gates_sender() {
         let tx = tx_with_fee(1);
 
         let mut allowed = HashSet::new();
@@ -228,16 +243,27 @@ mod tests {
             sender_allowlist: Some(allowed),
             ..Default::default()
         };
-        assert!(policy.check(&tx).await.is_ok());
+        assert!(policy.check_stateless(&tx).is_ok());
 
         let empty = SponsorPolicy {
             sender_allowlist: Some(HashSet::new()),
             ..Default::default()
         };
         assert!(matches!(
-            empty.check(&tx).await,
+            empty.check_stateless(&tx),
             Err(PolicyError::SenderNotAllowed(_))
         ));
+    }
+
+    /// `reserve` is a no-op when no stateful store is configured, so a policy
+    /// with only stateless guards never needs the (Redis) store to pass.
+    #[tokio::test]
+    async fn reserve_without_store_is_noop() {
+        let policy = SponsorPolicy {
+            max_cost_wei: Some(U256::MAX),
+            ..Default::default()
+        };
+        assert!(policy.reserve(&tx_with_fee(1)).await.is_ok());
     }
 
     #[test]

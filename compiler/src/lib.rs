@@ -66,10 +66,23 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
         // Find the VERIFY frame belonging to the sponsor and inject the sponsor signature.
         // This must precede the preflight: the node executes the real VERIFY
         // frames, so a sponsored prefix only passes once the signature is in place.
-        self.inject_sponsor_signature(&mut tx).await?;
+        // The stateless policy guards run here; the committing spend reservation
+        // is deferred to step 4.
+        let sponsored = self.inject_sponsor_signature(&mut tx).await?;
 
         // 3. Frame-aware preflight (ethrex_simulateFrameTransaction)
         self.simulate(&tx).await?;
+
+        // 4. Reserve sponsor spend only once the preflight has passed. The
+        // reservation commits against the per-sender quota and global budget and
+        // has no refund path, so a transaction the node would reject must not be
+        // allowed to consume it.
+        if sponsored {
+            self.policy
+                .reserve(&tx)
+                .await
+                .map_err(|e| CompilerError::Policy(e.to_string()))?;
+        }
 
         Ok(tx)
     }
@@ -459,13 +472,16 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
     /// signer address** — not merely "any non-sender VERIFY frame". A VERIFY frame
     /// pointing at some other address is a foreign paymaster arrangement whose
     /// signature that party supplies; the sponsor signature must never be attached
-    /// to a frame outside this signer's control. Before signing, the sponsor policy is
-    /// consulted (spend ceiling, allowlist, quota) since sponsoring makes this
-    /// signer the payer.
+    /// to a frame outside this signer's control.
+    ///
+    /// Returns `true` when a sponsor signature was injected. The stateless policy
+    /// guards (allowlist, spend ceiling) run here, before signing; the committing
+    /// spend reservation is deferred to after a successful preflight (see
+    /// [`compile_and_validate`](Self::compile_and_validate)).
     async fn inject_sponsor_signature(
         &self,
         tx: &mut FrameTransaction,
-    ) -> Result<(), CompilerError> {
+    ) -> Result<bool, CompilerError> {
         // The sponsor identity: the account whose key this compiler holds.
         // Lowercased hex (`0x…`) so it compares case-insensitively with a frame target.
         let sponsor_address = format!("{:#x}", self.sponsor_signer.address());
@@ -480,17 +496,18 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
             info!(
                 "No sponsor VERIFY frame targets this signer ({sponsor_address}); treating as self-relay or foreign sponsorship."
             );
-            return Ok(());
+            return Ok(false);
         };
 
         info!(
             "Found sponsor VERIFY frame at index {index} targeting this signer; enforcing policy before signing."
         );
 
-        // Sponsoring makes this signer the payer, so guard sponsor spend BEFORE signing.
+        // Sponsoring makes this signer the payer. Run the stateless guards
+        // (allowlist, ceiling) before signing; the committing spend reservation
+        // is deferred until the preflight has passed (see compile_and_validate).
         self.policy
-            .check(tx)
-            .await
+            .check_stateless(tx)
             .map_err(|e| CompilerError::Policy(e.to_string()))?;
 
         // Compute hash BEFORE mutating signatures (signature bytes are elided
@@ -519,6 +536,6 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 }

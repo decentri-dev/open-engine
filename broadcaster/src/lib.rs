@@ -1,2 +1,2 @@
 pub mod worker;
-pub use worker::MempoolBroadcaster;
+pub use worker::{BroadcastOutcome, MempoolBroadcaster};

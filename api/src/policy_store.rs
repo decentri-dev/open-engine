@@ -1,6 +1,12 @@
-//! Redis-backed stateful sponsor guards: a per-sender windowed spend quota and
-//! a cumulative global budget. This is the concrete [`PolicyStore`] the `public`
+//! Redis-backed stateful sponsor guards: a per-sender windowed spend quota and a
+//! windowed global budget. This is the concrete [`PolicyStore`] the `public`
 //! posture relies on to bound aggregate sponsor spend.
+//!
+//! Both guards are windowed: each is keyed by a time bucket carrying a TTL, so it
+//! resets when its window rolls and never permanently wedges. The global budget
+//! is therefore a cap on aggregate spend *per window* — its window defaults to
+//! the per-sender window but can be set coarser (e.g. an hourly per-sender quota
+//! beneath a daily aggregate budget).
 //!
 //! Spend is tracked in **gwei** (wei / 1e9) so Redis's 64-bit integer counters
 //! suffice — raw wei sums would overflow. Amounts are rounded up and limits
@@ -8,9 +14,10 @@
 //! reservation and never over-permits a limit. Reserve-or-reject executes as a
 //! single atomic Lua script, so concurrent requests cannot race past a limit.
 //!
-//! Reservations happen at compile time (before broadcast). A transaction that is
-//! later superseded or fails to broadcast is not refunded, so the counters can
-//! slightly over-count until the window rolls — conservative for a spend guard.
+//! Reservations happen after a successful preflight, before broadcast. A
+//! transaction that is later superseded or dropped is not refunded, so the
+//! counters can slightly over-count until the window rolls — conservative for a
+//! spend guard, and self-correcting each window.
 
 use alloy::primitives::{Address, U256};
 use open_engine_core::policy::{BoxFuture, PolicyError, PolicyStore};
@@ -20,14 +27,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const WEI_PER_GWEI: u128 = 1_000_000_000;
 
 /// Atomic reserve-or-reject. Checks the per-sender window key and the global
-/// budget key, and commits both increments only if neither limit would be
-/// exceeded. An empty limit argument disables that guard. Returns a status
+/// budget window key, and commits both increments only if neither limit would be
+/// exceeded. Each key carries a TTL so its window rolls (and the counter resets)
+/// once elapsed. An empty limit argument disables that guard. Returns a status
 /// string: `ok`, `quota`, or `budget`.
 const RESERVE_SCRIPT: &str = r#"
 local amount = tonumber(ARGV[1])
 local per_limit = ARGV[2]
-local ttl = tonumber(ARGV[3])
+local per_ttl = tonumber(ARGV[3])
 local global_limit = ARGV[4]
+local global_ttl = tonumber(ARGV[5])
 if per_limit ~= '' then
   local cur = tonumber(redis.call('GET', KEYS[1]) or '0')
   if cur + amount > tonumber(per_limit) then return 'quota' end
@@ -38,10 +47,11 @@ if global_limit ~= '' then
 end
 if per_limit ~= '' then
   redis.call('INCRBY', KEYS[1], amount)
-  redis.call('EXPIRE', KEYS[1], ttl)
+  redis.call('EXPIRE', KEYS[1], per_ttl)
 end
 if global_limit ~= '' then
   redis.call('INCRBY', KEYS[2], amount)
+  redis.call('EXPIRE', KEYS[2], global_ttl)
 end
 return 'ok'
 "#;
@@ -50,10 +60,12 @@ pub struct RedisPolicyStore {
     conn: ConnectionManager,
     /// Per-sender spend limit per window, in gwei (`None` disables the quota).
     per_sender_gwei: Option<i64>,
-    /// Window length in seconds (quota keys expire after this).
+    /// Per-sender window length in seconds (quota keys expire after this).
     window_secs: u64,
-    /// Cumulative global budget, in gwei (`None` disables the budget).
+    /// Global budget per window, in gwei (`None` disables the budget).
     global_budget_gwei: Option<i64>,
+    /// Global-budget window length in seconds (budget keys expire after this).
+    budget_window_secs: u64,
     script: Script,
 }
 
@@ -66,6 +78,7 @@ impl RedisPolicyStore {
         per_sender_wei: Option<U256>,
         window_secs: u64,
         global_budget_wei: Option<U256>,
+        budget_window_secs: u64,
     ) -> Result<Self, String> {
         let client = Client::open(redis_url).map_err(|e| e.to_string())?;
         let conn = ConnectionManager::new(client)
@@ -76,6 +89,7 @@ impl RedisPolicyStore {
             per_sender_gwei: per_sender_wei.map(wei_to_gwei_floor),
             window_secs: window_secs.max(1),
             global_budget_gwei: global_budget_wei.map(wei_to_gwei_floor),
+            budget_window_secs: budget_window_secs.max(1),
             script: Script::new(RESERVE_SCRIPT),
         })
     }
@@ -89,9 +103,10 @@ impl PolicyStore for RedisPolicyStore {
             }
 
             let amount = wei_to_gwei_ceil(max_cost);
-            let window_index = now_secs() / self.window_secs;
-            let sender_key = format!("sponsor:quota:{sender:#x}:{window_index}");
-            let global_key = "sponsor:budget:global";
+            let sender_window = now_secs() / self.window_secs;
+            let budget_window = now_secs() / self.budget_window_secs;
+            let sender_key = format!("sponsor:quota:{sender:#x}:{sender_window}");
+            let global_key = format!("sponsor:budget:global:{budget_window}");
             let per_limit = self
                 .per_sender_gwei
                 .map(|v| v.to_string())
@@ -110,6 +125,7 @@ impl PolicyStore for RedisPolicyStore {
                 .arg(per_limit)
                 .arg(self.window_secs as i64)
                 .arg(global_limit)
+                .arg(self.budget_window_secs as i64)
                 .invoke_async(&mut conn)
                 .await
                 .map_err(|e| PolicyError::Store(e.to_string()))?;
@@ -211,7 +227,7 @@ mod redis_tests {
     #[ignore = "requires redis"]
     async fn per_sender_quota_rejects_over_window() {
         let sender = unique_sender();
-        let store = RedisPolicyStore::connect(URL, Some(gwei(5)), 3600, None)
+        let store = RedisPolicyStore::connect(URL, Some(gwei(5)), 3600, None, 3600)
             .await
             .unwrap();
 
@@ -224,16 +240,20 @@ mod redis_tests {
     #[tokio::test]
     #[ignore = "requires redis"]
     async fn global_budget_rejects_when_exhausted() {
-        del("sponsor:budget:global").await;
+        // The global budget key is shared across all senders, so isolate this
+        // test with a wide window whose bucket key we can compute and clear.
+        let window = 100_000u64;
+        let key = format!("sponsor:budget:global:{}", now_secs() / window);
+        del(&key).await;
         let sender = unique_sender();
-        let store = RedisPolicyStore::connect(URL, None, 3600, Some(gwei(4)))
+        let store = RedisPolicyStore::connect(URL, None, 3600, Some(gwei(4)), window)
             .await
             .unwrap();
 
         store.try_reserve(sender, gwei(4)).await.expect("within budget");
         let err = store.try_reserve(sender, gwei(1)).await.unwrap_err();
         assert!(matches!(err, PolicyError::GlobalBudgetExhausted), "{err}");
-        del("sponsor:budget:global").await;
+        del(&key).await;
     }
 
     #[tokio::test]
@@ -243,7 +263,7 @@ mod redis_tests {
         // Window allows exactly 10 gwei; 20 concurrent 1-gwei reservations must
         // let through exactly 10 (atomic reserve-or-reject, no oversell).
         let store = Arc::new(
-            RedisPolicyStore::connect(URL, Some(gwei(10)), 3600, None)
+            RedisPolicyStore::connect(URL, Some(gwei(10)), 3600, None, 3600)
                 .await
                 .unwrap(),
         );

@@ -637,6 +637,9 @@ impl<H: DurableExecution> MultilaneQueue<H> {
 
                 local job_meta_hash = 'queue_multilane:' .. queue_id .. ':job:' .. job_id .. ':meta'
                 redis.call('HSET', job_meta_hash, 'processed_at', now)
+                -- The job is running again, so it is no longer waiting on a
+                -- deferred hold or a nack backoff.
+                redis.call('HDEL', job_meta_hash, 'deferred_until', 'retry_at')
                 local created_at = redis.call('HGET', job_meta_hash, 'created_at') or now
                 local attempts = redis.call('HINCRBY', job_meta_hash, 'attempts', 1)
 
@@ -951,6 +954,7 @@ impl<H: DurableExecution> MultilaneQueue<H> {
             job_errors_list: self.job_errors_list_name(job_id),
             dedupe_set: self.dedupe_set_name(),
             idempotency_mode: self.options.idempotency_mode.clone(),
+            max_job_errors: self.options.max_job_errors,
         }
     }
 
@@ -1190,7 +1194,13 @@ impl<H: DurableExecution> MultilaneQueue<H> {
             created_at: now,
         };
         let error_json = serde_json::to_string(&error_record)?;
-        hook_pipeline.lpush(self.job_errors_list_name(&job.id), error_json);
+        hook_pipeline
+            .lpush(self.job_errors_list_name(&job.id), error_json)
+            .ltrim(
+                self.job_errors_list_name(&job.id),
+                0,
+                self.options.max_job_errors as isize - 1,
+            );
 
         // For "active" idempotency mode, remove from deduplication set immediately
         if self.options.idempotency_mode == crate::queue::IdempotencyMode::Active {

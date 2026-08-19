@@ -14,8 +14,8 @@ use error::MessageQueueError;
 use hooks::TransactionContext;
 pub use job::BorrowedJob;
 pub use job::{
-    DelayOptions, Job, JobError, JobErrorRecord, JobErrorType, JobOptions, JobResult, JobStatus,
-    PushableJob, RequeuePosition,
+    DelayOptions, Job, JobError, JobErrorRecord, JobErrorType, JobOptions, JobResult, JobState,
+    JobStatus, PushableJob, RequeuePosition,
 };
 pub use multilane::{MultilanePushableJob, MultilaneQueue};
 use queue::QueueOptions;
@@ -333,6 +333,7 @@ impl<H: DurableExecution> Queue<H> {
             local job_meta_hash_name = KEYS[5]
 
             local dedupe_set_name = KEYS[6]
+            local job_result_hash_name = KEYS[7]
 
             -- Check if job already exists in any queue
             if redis.call('SISMEMBER', dedupe_set_name, job_id) == 1 then
@@ -342,6 +343,14 @@ impl<H: DurableExecution> Queue<H> {
 
             -- Store job data
             redis.call('HSET', job_data_hash_name, job_id, job_data)
+
+            -- Clear any residue from a previous job that reused this id. Job ids
+            -- are caller-chosen and reusable once the old one leaves the dedupe
+            -- set, so a stale 'finished_at' or result would otherwise make this
+            -- brand new job read as already completed.
+            redis.call('DEL', job_meta_hash_name)
+            redis.call('HDEL', job_result_hash_name, job_id)
+            redis.call('DEL', 'queue:' .. queue_id .. ':job:' .. job_id .. ':errors')
 
             -- Store job metadata as a hash
             redis.call('HSET', job_meta_hash_name, 'created_at', now)
@@ -396,6 +405,7 @@ impl<H: DurableExecution> Queue<H> {
             .key(self.job_data_hash_name())
             .key(self.job_meta_hash_name(&job.id))
             .key(self.dedupe_set_name())
+            .key(self.job_result_hash_name())
             .arg(job_options.id)
             .arg(job_data)
             .arg(now)
@@ -513,6 +523,142 @@ impl<H: DurableExecution> Queue<H> {
         } else {
             Ok(None)
         }
+    }
+
+    /// Resolve where a job currently sits in its lifecycle, along with whatever
+    /// its terminal outcome produced.
+    ///
+    /// Returns `None` when the job is unknown — either it never existed or it
+    /// has been pruned, which the caller cannot distinguish and should report as
+    /// "not found" either way.
+    ///
+    /// Done in one Lua call so the branch on `finished_at` and the read of the
+    /// result cannot straddle a concurrent completion or prune.
+    pub async fn get_job_state(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<JobState<H::Output, H::ErrorData>>, MessageQueueError> {
+        let script = redis::Script::new(
+            r#"
+            local job_meta_hash = KEYS[1]
+            local job_result_hash = KEYS[2]
+            local job_errors_list = KEYS[3]
+
+            local job_id = ARGV[1]
+
+            if redis.call('EXISTS', job_meta_hash) == 0 then
+                return { 'unknown', '', '' }
+            end
+
+            -- Terminal states first: a finished job may still carry stale hold
+            -- markers, since cancellation can finish a job that never ran.
+            if redis.call('HEXISTS', job_meta_hash, 'finished_at') == 1 then
+                local result = redis.call('HGET', job_result_hash, job_id)
+                if result then
+                    return { 'succeeded', result, '' }
+                end
+                return { 'failed', redis.call('LINDEX', job_errors_list, 0) or '', '' }
+            end
+
+            if redis.call('HEXISTS', job_meta_hash, 'lease_token') == 1 then
+                return { 'active', '', '' }
+            end
+
+            local deferred_until = redis.call('HGET', job_meta_hash, 'deferred_until')
+            if deferred_until then
+                return { 'deferred', '', deferred_until }
+            end
+
+            local retry_at = redis.call('HGET', job_meta_hash, 'retry_at')
+            if retry_at then
+                return { 'retrying', redis.call('LINDEX', job_errors_list, 0) or '', retry_at }
+            end
+
+            return { 'pending', '', '' }
+            "#,
+        );
+
+        let (state, payload, until): (String, String, String) = script
+            .key(self.job_meta_hash_name(job_id))
+            .key(self.job_result_hash_name())
+            .key(self.job_errors_list_name(job_id))
+            .arg(job_id)
+            .invoke_async(&mut self.redis.clone())
+            .await?;
+
+        // An error record that fails to parse must not sink the whole status
+        // read: the state itself is still accurate and useful without it.
+        let last_error = |json: &str| {
+            if json.is_empty() {
+                return None;
+            }
+            serde_json::from_str::<JobErrorRecord<H::ErrorData>>(json)
+                .map_err(|e| {
+                    tracing::warn!(job_id, error = %e, "Failed to parse stored job error record");
+                })
+                .ok()
+        };
+        let parse_until = |raw: &str| raw.parse::<u64>().unwrap_or(0);
+
+        Ok(match state.as_str() {
+            "unknown" => None,
+            "pending" => Some(JobState::Pending),
+            "active" => Some(JobState::Active),
+            "deferred" => Some(JobState::Deferred {
+                until: parse_until(&until),
+            }),
+            "retrying" => Some(JobState::Retrying {
+                until: parse_until(&until),
+                last_error: last_error(&payload),
+            }),
+            "succeeded" => Some(JobState::Succeeded(serde_json::from_str(&payload)?)),
+            "failed" => Some(JobState::Failed(last_error(&payload))),
+            other => {
+                return Err(MessageQueueError::Runtime {
+                    message: format!("Unexpected job state: {other}"),
+                })
+            }
+        })
+    }
+
+    /// The retained error records for a job, newest first.
+    ///
+    /// This is the per-attempt history behind [`Queue::get_job_state`]'s single
+    /// `last_error`: every nack and the terminal fail, each with the attempt it
+    /// belongs to and whether it was a retry or the end of the line. A job that
+    /// eventually succeeded keeps the records of the attempts that did not, so
+    /// this is readable in any state, terminal or not.
+    ///
+    /// Bounded twice over: by `max_job_errors` at write time and by `limit`
+    /// here. `attempts` on the job stays the authoritative count of how many
+    /// times it actually ran — the history may be shorter.
+    ///
+    /// A record that fails to deserialize is skipped rather than failing the
+    /// read, so one bad entry cannot hide the rest of a job's history.
+    pub async fn get_job_errors(
+        &self,
+        job_id: &str,
+        limit: usize,
+    ) -> Result<Vec<JobErrorRecord<H::ErrorData>>, MessageQueueError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = self.redis.clone();
+        let raw: Vec<String> = conn
+            .lrange(self.job_errors_list_name(job_id), 0, limit as isize - 1)
+            .await?;
+
+        Ok(raw
+            .iter()
+            .filter_map(|json| {
+                serde_json::from_str::<JobErrorRecord<H::ErrorData>>(json)
+                    .map_err(|e| {
+                        tracing::warn!(job_id, error = %e, "Skipping unparseable job error record");
+                    })
+                    .ok()
+            })
+            .collect())
     }
 
     pub async fn count(&self, status: JobStatus) -> Result<usize, MessageQueueError> {
@@ -867,6 +1013,9 @@ impl<H: DurableExecution> Queue<H> {
                     -- Update metadata
                     local job_meta_hash_name = 'queue:' .. queue_id .. ':job:' .. job_id .. ':meta'
                     redis.call('HSET', job_meta_hash_name, 'processed_at', now)
+                    -- The job is running again, so it is no longer waiting on a
+                    -- deferred hold or a nack backoff.
+                    redis.call('HDEL', job_meta_hash_name, 'deferred_until', 'retry_at')
                     local created_at = redis.call('HGET', job_meta_hash_name, 'created_at') or now
                     local attempts = redis.call('HINCRBY', job_meta_hash_name, 'attempts', 1)
 
@@ -1084,6 +1233,7 @@ impl<H: DurableExecution> Queue<H> {
             job_errors_list: self.job_errors_list_name(job_id),
             dedupe_set: self.dedupe_set_name(),
             idempotency_mode: self.options.idempotency_mode.clone(),
+            max_job_errors: self.options.max_job_errors,
         }
     }
 
@@ -1307,7 +1457,13 @@ impl<H: DurableExecution> Queue<H> {
             created_at: now,
         };
         let error_json = serde_json::to_string(&error_record)?;
-        hook_pipeline.lpush(self.job_errors_list_name(&job.id), error_json);
+        hook_pipeline
+            .lpush(self.job_errors_list_name(&job.id), error_json)
+            .ltrim(
+                self.job_errors_list_name(&job.id),
+                0,
+                self.options.max_job_errors as isize - 1,
+            );
 
         // For "active" idempotency mode, remove from deduplication set immediately
         if self.options.idempotency_mode == queue::IdempotencyMode::Active {

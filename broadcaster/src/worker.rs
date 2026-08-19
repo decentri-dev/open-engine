@@ -23,6 +23,23 @@ pub const MAX_NONCE_HOLD_SECS: u64 = 300;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BroadcasterError(pub String);
 
+/// What the broadcaster did with a frame transaction, stored as the job result.
+///
+/// Both variants are `Ok`: a superseded transaction is not a failure, it is a
+/// keyed nonce slot the chain resolved without this job. They stay distinct
+/// variants rather than one message string so a status reader never has to tell
+/// a real broadcast from a drop by matching on substrings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum BroadcastOutcome {
+    /// The node accepted the raw transaction and returned this hash. Mempool
+    /// admission only — inclusion still requires a receipt.
+    Broadcast { tx_hash: String },
+    /// A selected key had already advanced past `nonce_seq`, so the transaction
+    /// can never become valid. Dropped without being sent.
+    Superseded { nonce_seq: u64 },
+}
+
 impl queue::UserCancellable for BroadcasterError {
     fn user_cancelled() -> Self {
         BroadcasterError("User cancelled".to_string())
@@ -120,7 +137,7 @@ fn frame_summary(tx: &FrameTransaction) -> String {
 }
 
 impl<G: ChainGateway + Send + Sync + 'static> DurableExecution for MempoolBroadcaster<G> {
-    type Output = String; // The Tx Hash
+    type Output = BroadcastOutcome;
     type ErrorData = BroadcasterError;
     type JobData = FrameTransaction;
 
@@ -192,7 +209,7 @@ impl<G: ChainGateway + Send + Sync + 'static> DurableExecution for MempoolBroadc
                     nonce_seq = seq,
                     "A selected key has advanced past nonce_seq; treating job as superseded"
                 );
-                return Ok("Dropped (nonce too low)".to_string());
+                return Ok(BroadcastOutcome::Superseded { nonce_seq: seq });
             }
             SeqState::Future => {
                 // Not yet executable. The public mempool only holds one pending
@@ -305,7 +322,9 @@ impl<G: ChainGateway + Send + Sync + 'static> DurableExecution for MempoolBroadc
             "Node accepted raw frame transaction and returned a hash; inclusion still requires a receipt"
         );
 
-        Ok(tx_hash.to_string())
+        Ok(BroadcastOutcome::Broadcast {
+            tx_hash: tx_hash.to_string(),
+        })
     }
 }
 
@@ -380,8 +399,12 @@ mod tests {
 
     #[tokio::test]
     async fn executable_nonce_broadcasts() {
-        let res = broadcaster(5).process(&job(sample_tx(Some(5)), now())).await;
-        assert!(res.is_ok(), "expected broadcast, got {res:?}");
+        match broadcaster(5).process(&job(sample_tx(Some(5)), now())).await {
+            Ok(BroadcastOutcome::Broadcast { tx_hash }) => {
+                assert!(tx_hash.starts_with("0x"), "got {tx_hash}")
+            }
+            other => panic!("expected broadcast, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -407,7 +430,7 @@ mod tests {
     #[tokio::test]
     async fn too_low_nonce_is_dropped_as_superseded() {
         match broadcaster(9).process(&job(sample_tx(Some(5)), now())).await {
-            Ok(msg) => assert!(msg.contains("nonce too low"), "got {msg}"),
+            Ok(BroadcastOutcome::Superseded { nonce_seq }) => assert_eq!(nonce_seq, 5),
             other => panic!("expected superseded drop, got {other:?}"),
         }
     }
@@ -423,7 +446,10 @@ mod tests {
         // Non-zero keys, all currently at sequence 3, tx wants 3 -> executable.
         let tx = keyed_tx(vec![U256::from(7u64), U256::from(9u64)], Some(3));
         let res = broadcaster(3).process(&job(tx, now())).await;
-        assert!(res.is_ok(), "expected broadcast, got {res:?}");
+        assert!(
+            matches!(res, Ok(BroadcastOutcome::Broadcast { .. })),
+            "expected broadcast, got {res:?}"
+        );
     }
 
     #[tokio::test]

@@ -254,6 +254,37 @@ pub enum JobStatus {
     Failed,
 }
 
+/// Where a single job sits in its lifecycle, read from queue state rather than
+/// inferred from the timestamps on [`Job`].
+///
+/// `processed_at` cannot carry this on its own: it is stamped on the first pop
+/// and never cleared, so a job that ran once and was then rescheduled still
+/// carries it while sitting idle. `Active` is therefore keyed on a live lease,
+/// and the terminal split is keyed on whether a result was recorded — not on
+/// which list the id landed in, because a handler is free to return `Ok` for an
+/// outcome that was not a plain success.
+#[derive(Debug, Clone)]
+pub enum JobState<O, E> {
+    /// Queued and waiting for a worker, with no scheduled time in the future.
+    Pending,
+    /// Held by [`JobError::Defer`] — waiting on an external precondition, not on
+    /// a failure — and eligible to run again at `until` (epoch seconds).
+    Deferred { until: u64 },
+    /// Backing off after a [`JobError::Nack`], eligible to run again at `until`
+    /// (epoch seconds). `last_error` is the most recent recorded attempt.
+    Retrying {
+        until: u64,
+        last_error: Option<JobErrorRecord<E>>,
+    },
+    /// A worker holds a live lease and is running the handler right now.
+    Active,
+    /// Terminal: the handler returned `Ok`, carrying what it returned.
+    Succeeded(O),
+    /// Terminal: the handler returned [`JobError::Fail`], or the job was
+    /// cancelled. Cancellation records no error, hence the `Option`.
+    Failed(Option<JobErrorRecord<E>>),
+}
+
 pub struct JobOptions<T>
 where
     T: Serialize + DeserializeOwned + Send + Sync + 'static,

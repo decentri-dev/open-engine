@@ -2,7 +2,7 @@ mod common;
 use common::{MockGateway, DUMMY_SENDER, SPONSOR_KEY};
 
 use alloy::primitives::{B256};
-use broadcaster::MempoolBroadcaster;
+use broadcaster::{BroadcastOutcome, MempoolBroadcaster};
 use compiler::FrameCompiler;
 use open_engine_core::domain::{Frame, FrameMode, FrameSignature, FrameTransaction};
 use open_engine_core::signer::{InMemorySigner, Signer};
@@ -79,12 +79,15 @@ async fn compiles_and_queues_self_relay_tx() {
     let result = broadcaster.process(&borrowed_job).await;
 
     assert!(result.is_ok(), "Broadcasting failed: {:?}", result.err());
-    let tx_hash = result.unwrap();
 
     // Verify the tx hash matches the mock gateway's hash
-    assert_eq!(tx_hash, B256::repeat_byte(0xaa).to_string());
+    let outcome = result.unwrap();
+    let BroadcastOutcome::Broadcast { tx_hash } = &outcome else {
+        panic!("expected a broadcast, got {outcome:?}");
+    };
+    assert_eq!(tx_hash, &B256::repeat_byte(0xaa).to_string());
 
-    println!("Self-relay compile -> queue -> broadcast flow succeeded. Tx Hash: {}", tx_hash);
+    println!("Self-relay compile -> queue -> broadcast flow succeeded. Tx Hash: {tx_hash}");
 }
 
 #[tokio::test]
@@ -183,8 +186,11 @@ async fn compiles_and_queues_sponsored_tx() {
     let result = broadcaster.process(&borrowed_job).await;
 
     assert!(result.is_ok(), "Broadcasting failed: {:?}", result.err());
-    let tx_hash = result.unwrap();
 
-    assert_eq!(tx_hash, B256::repeat_byte(0xbb).to_string());
-    println!("Successfully compiled and queued sponsored tx! Tx Hash: {}", tx_hash);
+    let outcome = result.unwrap();
+    let BroadcastOutcome::Broadcast { tx_hash } = &outcome else {
+        panic!("expected a broadcast, got {outcome:?}");
+    };
+    assert_eq!(tx_hash, &B256::repeat_byte(0xbb).to_string());
+    println!("Successfully compiled and queued sponsored tx! Tx Hash: {tx_hash}");
 }

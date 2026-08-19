@@ -26,6 +26,14 @@ impl Default for IdempotencyMode {
 pub struct QueueOptions {
     pub max_success: usize,
     pub max_failed: usize,
+
+    /// How many of a job's most recent error records to retain.
+    ///
+    /// Attempts are not capped — a handler can nack indefinitely — so without a
+    /// bound this list grows for as long as a job keeps failing. The retained
+    /// tail is what diagnostics read; `attempts` on the job remains the true
+    /// count regardless of how many records were dropped.
+    pub max_job_errors: usize,
     pub lease_duration: Duration,
     pub local_concurrency: usize,
 
@@ -47,6 +55,7 @@ impl Default for QueueOptions {
         Self {
             max_success: 1000,
             max_failed: 10000,
+            max_job_errors: 50,
             local_concurrency: 100,
             polling_interval: Duration::from_millis(100),
             lease_duration: Duration::from_secs(30),

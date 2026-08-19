@@ -152,6 +152,7 @@ async fn job_lease_expiry() {
     let queue_options = QueueOptions {
         max_success: 1000,
         max_failed: 1000,
+        max_job_errors: 50,
         lease_duration,
         polling_interval: Duration::from_millis(100),
         local_concurrency: 1,
@@ -301,6 +302,7 @@ async fn multiple_job_lease_expiry() {
     let queue_options = QueueOptions {
         max_success: 1000,
         max_failed: 1000,
+        max_job_errors: 50,
         local_concurrency: 3,
         lease_duration,
         polling_interval: Duration::from_millis(100),

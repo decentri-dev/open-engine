@@ -724,7 +724,9 @@ dependencies = [
  "open_engine_core",
  "queue",
  "serde",
+ "serde_json",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

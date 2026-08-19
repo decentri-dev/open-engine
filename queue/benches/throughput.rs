@@ -178,6 +178,7 @@ async fn load_test_throughput(
         lease_duration: Duration::from_secs(30),     // Reasonable lease time
         max_success: 10000,                          // Large success queue
         max_failed: 1000,                            // Reasonable failed queue
+        max_job_errors: 50,
     };
 
     let benchmark_handler = BenchmarkJobHandler {

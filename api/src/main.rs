@@ -1,24 +1,28 @@
 use axum::{
-    extract::State,
+    extract::{FromRef, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
-use broadcaster::MempoolBroadcaster;
+use broadcaster::{worker::BroadcasterError, BroadcastOutcome, MempoolBroadcaster};
 use compiler::FrameCompiler;
 mod policy_store;
 
 use open_engine_core::{
     domain::FrameTransaction,
-    gateway::AlloyGateway,
+    gateway::{AlloyGateway, ChainGateway},
     policy::{Posture, PolicyStore, SponsorPolicy},
     signer::{Signer, SponsorSigner},
 };
 use policy_store::RedisPolicyStore;
 use std::collections::HashSet;
-use queue::{job::JobOptions, PushOutcome, Queue, ReplaceOutcome};
+use queue::{
+    job::{JobErrorRecord, JobErrorType, JobOptions},
+    JobState, PushOutcome, Queue, ReplaceOutcome,
+};
 use serde::Serialize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -52,6 +56,7 @@ struct ErrorBody {
 /// connection strings, etc.) never leak outward.
 enum ApiError {
     BadRequest(String),
+    NotFound(String),
     Internal(String),
 }
 
@@ -59,6 +64,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             ApiError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+            ApiError::NotFound(message) => (StatusCode::NOT_FOUND, message),
             ApiError::Internal(detail) => {
                 tracing::error!(error = %detail, "Internal error handling transaction request");
                 (
@@ -142,6 +148,19 @@ type AppCompiler = FrameCompiler<AlloyGateway, SponsorSigner>;
 struct AppState {
     compiler: Arc<AppCompiler>,
     queue: Arc<AppQueue>,
+    tx_received: Arc<AtomicU64>,
+    tx_queued: Arc<AtomicU64>,
+}
+
+/// Lets a handler ask for just the queue instead of the whole [`AppState`].
+///
+/// The status endpoint reads queue state and nothing else — no compiler, no
+/// signer, no RPC. Depending only on what it uses keeps that true, and lets it
+/// be mounted against a queue alone.
+impl FromRef<AppState> for Arc<AppQueue> {
+    fn from_ref(state: &AppState) -> Self {
+        state.queue.clone()
+    }
 }
 
 fn frame_summary(tx: &FrameTransaction) -> String {
@@ -162,6 +181,232 @@ fn frame_summary(tx: &FrameTransaction) -> String {
         .join(", ")
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobStateResponse {
+    pub job_id: String,
+    /// Lifecycle slug: `pending`, `waitingForNonce`, `retrying`, `broadcasting`,
+    /// `broadcast`, `superseded`, or `failed`. See [`describe_state`] for what
+    /// each one means — in particular, `broadcast` is mempool admission, never
+    /// inclusion in a block.
+    pub status: String,
+    pub attempts: u32,
+    pub created_at: u64,
+    pub processed_at: Option<u64>,
+    pub finished_at: Option<u64>,
+    /// Set only on `broadcast`: the hash the node returned. Clients cannot
+    /// derive this themselves for a sponsored transaction, because the sponsor
+    /// signature is injected here after the client signed, so this is the only
+    /// place the final hash exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_hash: Option<String>,
+    /// Why the job is in this status, in one line. Present whenever the status
+    /// word alone does not say it — a superseded drop, a failure, a hold, a
+    /// backoff — and absent when it does.
+    ///
+    /// This explains the *current* status; `failedAttempts` is the per-attempt
+    /// log. For `retrying` and `failed` the two overlap, because the reason for
+    /// the status is what the newest attempt hit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Set on `waitingForNonce` and `retrying`: epoch seconds at which the job
+    /// becomes eligible to run again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<u64>,
+    /// The attempts that errored, newest first — including those of a job that
+    /// went on to succeed, which is where a flaky RPC endpoint shows up.
+    ///
+    /// Only failures are recorded, so this is shorter than `attempts` and empty
+    /// for a job that has never errored.
+    pub failed_attempts: Vec<FailedAttempt>,
+}
+
+/// How many attempt records to return. Deep history is for diagnostics, and the
+/// queue retains a bounded tail anyway; `attempts` carries the true count.
+const MAX_REPORTED_FAILED_ATTEMPTS: usize = 20;
+
+/// One attempt at broadcasting a transaction that ended in an error.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FailedAttempt {
+    /// Which attempt this was. Holds for a predecessor nonce are not attempts
+    /// and never appear here, so these numbers can skip.
+    pub attempt: u32,
+    /// Epoch seconds at which the attempt failed.
+    pub at: u64,
+    /// `retry` if the engine intended to try again, `terminal` if this ended the
+    /// job. At most one `terminal` record exists, and it is the newest.
+    pub outcome: &'static str,
+    pub message: String,
+    /// For a `retry`, how long the engine waited before the next attempt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_delay_secs: Option<u64>,
+}
+
+impl From<JobErrorRecord<BroadcasterError>> for FailedAttempt {
+    fn from(record: JobErrorRecord<BroadcasterError>) -> Self {
+        let (outcome, retry_delay_secs) = match record.details {
+            JobErrorType::Nack(requeue) => ("retry", requeue.delay.map(|d| d.as_secs())),
+            JobErrorType::Fail => ("terminal", None),
+        };
+        FailedAttempt {
+            attempt: record.attempt,
+            at: record.created_at,
+            outcome,
+            message: record.error.0,
+            retry_delay_secs,
+        }
+    }
+}
+
+/// Fields describing a job's lifecycle position, projected from [`JobState`].
+#[derive(Default)]
+struct StateView {
+    status: &'static str,
+    tx_hash: Option<String>,
+    reason: Option<String>,
+    retry_after: Option<u64>,
+}
+
+/// Projects the queue's lifecycle state onto the wire vocabulary.
+///
+/// The distinctions this preserves, all of which a single `finished` flag lost:
+/// a benign nonce hold is not a broadcast in progress, a superseded drop is not
+/// a delivery, and a permanent failure is not a success. Nothing here reports
+/// on-chain inclusion — the engine hands off at the mempool and never watches
+/// for a receipt, so `broadcast` is as far as its knowledge goes.
+fn describe_state(state: JobState<BroadcastOutcome, BroadcasterError>) -> StateView {
+    match state {
+        JobState::Pending => StateView {
+            status: "pending",
+            ..Default::default()
+        },
+        // The broadcaster's only Defer is the keyed-nonce hold: the transaction
+        // is valid but its predecessor sequence has not landed yet.
+        JobState::Deferred { until } => StateView {
+            status: "waitingForNonce",
+            reason: Some(
+                "the predecessor sequence for a selected nonce key has not landed on-chain yet"
+                    .to_string(),
+            ),
+            retry_after: Some(until),
+            ..Default::default()
+        },
+        JobState::Retrying { until, last_error } => StateView {
+            status: "retrying",
+            reason: last_error.map(|record| record.error.0),
+            retry_after: Some(until),
+            ..Default::default()
+        },
+        JobState::Active => StateView {
+            status: "broadcasting",
+            ..Default::default()
+        },
+        JobState::Succeeded(BroadcastOutcome::Broadcast { tx_hash }) => StateView {
+            status: "broadcast",
+            tx_hash: Some(tx_hash),
+            ..Default::default()
+        },
+        JobState::Succeeded(BroadcastOutcome::Superseded { nonce_seq }) => StateView {
+            status: "superseded",
+            reason: Some(format!(
+                "a selected key advanced past nonce_seq {nonce_seq}; the transaction was dropped without being sent"
+            )),
+            ..Default::default()
+        },
+        JobState::Failed(last_error) => StateView {
+            status: "failed",
+            reason: Some(
+                last_error
+                    .map(|record| record.error.0)
+                    .unwrap_or_else(|| "job was cancelled".to_string()),
+            ),
+            ..Default::default()
+        },
+    }
+}
+
+/// Endpoint for GET /transaction/:job_id
+/// Retrieves the real-time state of a queued frame transaction job.
+///
+/// Generic over the gateway so the handler can be mounted against a queue built
+/// on any [`ChainGateway`]; it never calls one itself.
+async fn handle_get_transaction_state<G: ChainGateway + Send + Sync + 'static>(
+    State(queue): State<Arc<Queue<MempoolBroadcaster<G>>>>,
+    Path(job_id): Path<String>,
+) -> Result<(StatusCode, Json<JobStateResponse>), ApiError> {
+    let job = queue
+        .get_job(&job_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to fetch job: {e}")))?;
+
+    // Read the lifecycle state separately from the job record: the timestamps on
+    // the job cannot express it. `processed_at` is stamped on the first pop and
+    // never cleared, so it marks "has run at least once", not "is running" — a
+    // job held for a predecessor nonce carries it while doing nothing.
+    let lifecycle = queue
+        .get_job_state(&job_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to fetch job state: {e}")))?;
+
+    // A pruned job disappears from both reads, and the two reads are not one
+    // transaction, so require both rather than reporting a half-present job.
+    let (Some(job), Some(lifecycle)) = (job, lifecycle) else {
+        return Err(ApiError::NotFound(format!(
+            "Transaction job '{job_id}' not found"
+        )));
+    };
+
+    // Read the attempt history regardless of state: the errors a job survived
+    // are as diagnostic as the one that ended it, and a job that succeeded on
+    // its fourth try is the case worth being able to see.
+    let failed_attempts = queue
+        .get_job_errors(&job_id, MAX_REPORTED_FAILED_ATTEMPTS)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to fetch job errors: {e}")))?;
+
+    let view = describe_state(lifecycle);
+
+    Ok((
+        StatusCode::OK,
+        Json(JobStateResponse {
+            job_id: job.id,
+            status: view.status.to_string(),
+            attempts: job.attempts,
+            created_at: job.created_at,
+            processed_at: job.processed_at,
+            finished_at: job.finished_at,
+            tx_hash: view.tx_hash,
+            reason: view.reason,
+            retry_after: view.retry_after,
+            failed_attempts: failed_attempts.into_iter().map(FailedAttempt::from).collect(),
+        }),
+    ))
+}
+
+/// Endpoint for GET /health
+/// Used by load balancers and container orchestration to check service liveness.
+async fn handle_health() -> &'static str {
+    "OK"
+}
+
+/// Endpoint for GET /metrics
+/// Exposes internal metrics (e.g., for Prometheus).
+async fn handle_metrics(State(state): State<AppState>) -> String {
+    let received = state.tx_received.load(Ordering::Relaxed);
+    let queued = state.tx_queued.load(Ordering::Relaxed);
+    
+    format!(
+        "# HELP open_engine_transactions_received_total Total transactions received by the API\n\
+         # TYPE open_engine_transactions_received_total counter\n\
+         open_engine_transactions_received_total {}\n\
+         # HELP open_engine_transactions_queued_total Total transactions successfully queued\n\
+         # TYPE open_engine_transactions_queued_total counter\n\
+         open_engine_transactions_queued_total {}\n",
+        received, queued
+    )
+}
+
 /// Endpoint for POST /transaction
 /// Strictly accepts a fully structured EIP-8141 FrameTransaction payload from the SDK.
 async fn handle_transaction(
@@ -177,6 +422,7 @@ async fn handle_transaction(
         signatures = payload.signatures.len(),
         "Received strict FrameTransaction payload"
     );
+    state.tx_received.fetch_add(1, Ordering::Relaxed);
     tracing::debug!(
         sender = %payload.sender,
         frame_summary = %frame_summary(&payload),
@@ -245,6 +491,7 @@ async fn handle_transaction(
 
     match outcome {
         PushOutcome::Created => {
+            state.tx_queued.fetch_add(1, Ordering::Relaxed);
             tracing::info!(
                 job_id = %job.id,
                 "Frame transaction accepted by API queue layer; worker broadcast is asynchronous"
@@ -375,7 +622,27 @@ async fn build_sponsor_signer() -> SponsorSigner {
         .await
         .unwrap_or_else(|e| panic!("Failed to initialize sponsor signer: {e}"));
 
-    tracing::info!(sponsor_address = %signer.address(), signer = ?signer, "Sponsor signer initialized");
+    // Boot-time self-test: confirm the signer can actually produce a signature,
+    // not merely resolve its address. For a KMS backend address() needs only the
+    // GetPublicKey grant, whereas signing needs a separate Sign permission — this
+    // surfaces that misconfiguration at startup instead of on the first sponsored
+    // transaction. The digest is a throwaway constant and nothing is broadcast.
+    match signer.sign_hash(&alloy::primitives::B256::ZERO).await {
+        Ok(sig) if sig.len() == 65 => {}
+        Ok(sig) => panic!(
+            "Sponsor signer produced a malformed signature ({} bytes, expected 65); refusing to start",
+            sig.len()
+        ),
+        Err(e) => panic!(
+            "Sponsor signer failed a boot-time test sign (for a KMS key, verify the Sign permission is granted, not just GetPublicKey): {e}"
+        ),
+    }
+
+    tracing::info!(
+        sponsor_address = %signer.address(),
+        signer = ?signer,
+        "Sponsor signer initialized (boot-time test sign OK)"
+    );
     signer
 }
 
@@ -432,10 +699,28 @@ async fn build_sponsor_policy(redis_url: &str) -> SponsorPolicy {
         })
         .unwrap_or(3600);
 
+    // The global budget is a per-window cap (self-healing, like the per-sender
+    // quota). Its window defaults to the per-sender window but can be set coarser
+    // — e.g. an hourly per-sender quota beneath a daily aggregate budget.
+    let budget_window_secs = std::env::var("SPONSOR_BUDGET_WINDOW_SECS")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .unwrap_or_else(|e| panic!("SPONSOR_BUDGET_WINDOW_SECS must be a u64: {e}"))
+        })
+        .unwrap_or(window_secs);
+
     let store: Option<Arc<dyn PolicyStore>> = if per_sender.is_some() || global_budget.is_some() {
-        let store = RedisPolicyStore::connect(redis_url, per_sender, window_secs, global_budget)
-            .await
-            .unwrap_or_else(|e| panic!("Failed to connect sponsor policy store to Redis: {e}"));
+        let store = RedisPolicyStore::connect(
+            redis_url,
+            per_sender,
+            window_secs,
+            global_budget,
+            budget_window_secs,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Failed to connect sponsor policy store to Redis: {e}"));
         Some(Arc::new(store))
     } else {
         None
@@ -504,6 +789,8 @@ async fn main() {
     let state = AppState {
         compiler,
         queue: Arc::new(queue),
+        tx_received: Arc::new(AtomicU64::new(0)),
+        tx_queued: Arc::new(AtomicU64::new(0)),
     };
 
     // Start the Queue Worker
@@ -514,9 +801,388 @@ async fn main() {
 
     let app = Router::new()
         .route("/transaction", post(handle_transaction))
+        .route("/transaction/:job_id", get(handle_get_transaction_state))
+        .route("/health", get(handle_health))
+        .route("/metrics", get(handle_metrics))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3001").await.unwrap();
     tracing::info!("Listening on 0.0.0.0:3001");
     axum::serve(listener, app).await.unwrap();
+}
+
+/// Drives the real router over HTTP against a real Redis-backed queue.
+///
+/// The unit tests below cover the projection in isolation; this covers the part
+/// they cannot — that the handler wires three separate reads into one response,
+/// that the status vocabulary survives serialization, and that a job the worker
+/// actually processed reports what it produced. The chain is the only thing
+/// stubbed: the queue, the worker, the completion path and the HTTP layer are
+/// all the real ones.
+///
+/// Requires Redis on 127.0.0.1:6379, as the queue crate's own suite does.
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use alloy::primitives::B256;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use open_engine_core::domain::{Frame, FrameMode};
+    use open_engine_core::gateway::MockGateway;
+    use queue::redis;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tower::ServiceExt;
+
+    const REDIS_URL: &str = "redis://127.0.0.1:6379/";
+    const SENDER: &str = "0x1111111111111111111111111111111111111111";
+
+    type TestQueue = Queue<MempoolBroadcaster<MockGateway>>;
+
+    fn unique_queue_name(prefix: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        format!("test_http_{prefix}_{nanos}")
+    }
+
+    async fn cleanup(queue: &TestQueue) {
+        let mut conn = queue.redis.clone();
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(format!("queue:{}:*", queue.name()))
+            .query_async(&mut conn)
+            .await
+            .unwrap_or_default();
+        if !keys.is_empty() {
+            redis::cmd("DEL")
+                .arg(keys)
+                .query_async::<_, ()>(&mut conn)
+                .await
+                .unwrap_or_default();
+        }
+    }
+
+    /// A queue whose broadcaster sees `onchain_nonce` as the current sequence of
+    /// every key, and whose node returns `tx_hash` for any raw transaction.
+    async fn test_queue(name: &str, onchain_nonce: u64, tx_hash: B256) -> Arc<TestQueue> {
+        let gateway = Arc::new(MockGateway {
+            nonce: onchain_nonce,
+            tx_hash,
+            ..Default::default()
+        });
+        let queue = Arc::new(
+            Queue::new(REDIS_URL, name, None, MempoolBroadcaster::new(gateway))
+                .await
+                .expect("Redis must be running on 127.0.0.1:6379 for this test"),
+        );
+        cleanup(&queue).await;
+        queue
+    }
+
+    /// The real route, mounted on the queue alone.
+    fn router(queue: Arc<TestQueue>) -> Router {
+        Router::new()
+            .route("/transaction/:job_id", get(handle_get_transaction_state))
+            .with_state(queue)
+    }
+
+    async fn fetch(app: &Router, job_id: &str) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/transaction/{job_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request failed");
+
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice(&bytes).expect("response must be JSON");
+        (status, body)
+    }
+
+    /// Poll the endpoint until it reports `expected`, so the test never depends
+    /// on worker scheduling. Polling through HTTP is itself the thing under test.
+    async fn get_until(app: &Router, job_id: &str, expected: &str) -> serde_json::Value {
+        let mut last = serde_json::Value::Null;
+        for _ in 0..100 {
+            let (code, body) = fetch(app, job_id).await;
+            assert_eq!(code, StatusCode::OK, "unexpected status code: {body}");
+            if body["status"] == expected {
+                return body;
+            }
+            last = body;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("timed out waiting for status '{expected}'; last response was {last}");
+    }
+
+    fn frame_tx(nonce_seq: u64) -> FrameTransaction {
+        FrameTransaction {
+            chain_id: 1,
+            nonce_keys: vec![alloy::primitives::U256::ZERO],
+            nonce_seq: Some(nonce_seq),
+            sender: SENDER.to_string(),
+            max_priority_fee_per_gas: Some(1),
+            max_fee_per_gas: Some(2),
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: vec![],
+            recent_root_references: vec![],
+            signatures: vec![],
+            frames: vec![Frame {
+                mode: FrameMode::Verify,
+                flags: 0x03,
+                target: Some(SENDER.to_string()),
+                gas_limit: 21000,
+                value: "0".to_string(),
+                data: "0x".to_string(),
+            }],
+        }
+    }
+
+    async fn push(queue: &TestQueue, job_id: &str, nonce_seq: u64) {
+        queue
+            .push(JobOptions::new(frame_tx(nonce_seq)).with_id(job_id))
+            .await
+            .expect("push failed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_job_is_a_json_404() {
+        let queue = test_queue(&unique_queue_name("404"), 0, B256::ZERO).await;
+        let app = router(queue.clone());
+
+        let (code, body) = fetch(&app, "0xdead:0:1").await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        // Errors must share the content type of successes, not be raw text.
+        assert!(
+            body["error"].as_str().unwrap().contains("not found"),
+            "got {body}"
+        );
+
+        cleanup(&queue).await;
+    }
+
+    /// A queued job that no worker has touched: every optional field absent, and
+    /// an empty history rather than a missing one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_job_reports_pending() {
+        let queue = test_queue(&unique_queue_name("pending"), 0, B256::ZERO).await;
+        let app = router(queue.clone());
+
+        let job_id = "0xabc:0:1";
+        push(&queue, job_id, 1).await;
+
+        let (code, body) = fetch(&app, job_id).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["status"], "pending");
+        assert_eq!(body["jobId"], job_id);
+        assert_eq!(body["attempts"], 0);
+        assert_eq!(body["failedAttempts"].as_array().unwrap().len(), 0);
+        assert!(body["finishedAt"].is_null());
+        assert!(body.get("txHash").is_none(), "absent until broadcast: {body}");
+        assert!(body.get("reason").is_none(), "nothing to explain: {body}");
+        assert!(body.get("retryAfter").is_none());
+
+        cleanup(&queue).await;
+    }
+
+    /// The full path: a real worker pops the job, the real broadcaster encodes
+    /// and sends it, and the endpoint reports the hash the node returned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broadcast_job_reports_its_transaction_hash_over_http() {
+        let tx_hash = B256::repeat_byte(0xab);
+        let queue = test_queue(&unique_queue_name("broadcast"), 5, tx_hash).await;
+        let app = router(queue.clone());
+
+        let job_id = "0xabc:0:5";
+        push(&queue, job_id, 5).await;
+        let worker = queue.clone().work();
+
+        let body = get_until(&app, job_id, "broadcast").await;
+        assert_eq!(body["txHash"], tx_hash.to_string());
+        assert!(body["finishedAt"].is_number(), "got {body}");
+        assert_eq!(body["attempts"], 1);
+        assert_eq!(body["failedAttempts"].as_array().unwrap().len(), 0);
+        assert!(body.get("reason").is_none(), "a clean broadcast: {body}");
+
+        worker.shutdown().await.unwrap();
+        cleanup(&queue).await;
+    }
+
+    /// The distinction that a bare `finished` lost: the chain moved past this
+    /// slot, nothing was sent, and the response says so without a hash.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn superseded_job_reports_no_hash_and_explains_itself() {
+        // On-chain sequence 9, transaction wants 5: it can never be valid.
+        let queue = test_queue(&unique_queue_name("superseded"), 9, B256::repeat_byte(0xcd)).await;
+        let app = router(queue.clone());
+
+        let job_id = "0xabc:0:5";
+        push(&queue, job_id, 5).await;
+        let worker = queue.clone().work();
+
+        let body = get_until(&app, job_id, "superseded").await;
+        assert!(body.get("txHash").is_none(), "nothing was sent: {body}");
+        assert!(
+            body["reason"].as_str().unwrap().contains("nonce_seq 5"),
+            "got {body}"
+        );
+
+        worker.shutdown().await.unwrap();
+        cleanup(&queue).await;
+    }
+
+    /// A job held for a predecessor nonce reports the hold and when it will be
+    /// retried — not `broadcasting`, which is what it looked like before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn held_job_reports_waiting_for_nonce_over_http() {
+        // On-chain sequence 0, transaction wants 5: valid later, not now.
+        let queue = test_queue(&unique_queue_name("hold"), 0, B256::ZERO).await;
+        let app = router(queue.clone());
+
+        let job_id = "0xabc:0:5";
+        push(&queue, job_id, 5).await;
+        let worker = queue.clone().work();
+
+        let body = get_until(&app, job_id, "waitingForNonce").await;
+        assert!(body["retryAfter"].is_number(), "got {body}");
+        assert!(body["processedAt"].is_number(), "the job was popped: {body}");
+        assert!(body["finishedAt"].is_null());
+        // A hold is not a failed attempt and must not be recorded as one.
+        assert_eq!(body["failedAttempts"].as_array().unwrap().len(), 0);
+        assert_eq!(body["attempts"], 0, "a hold is not an attempt: {body}");
+
+        worker.shutdown().await.unwrap();
+        cleanup(&queue).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use queue::job::RequeuePosition;
+    use std::time::Duration;
+
+    fn error_record(reason: &str) -> JobErrorRecord<BroadcasterError> {
+        JobErrorRecord {
+            error: BroadcasterError(reason.to_string()),
+            attempt: 1,
+            details: JobErrorType::fail(),
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn broadcast_reports_its_hash() {
+        let view = describe_state(JobState::Succeeded(BroadcastOutcome::Broadcast {
+            tx_hash: "0xabc".to_string(),
+        }));
+        assert_eq!(view.status, "broadcast");
+        assert_eq!(view.tx_hash.as_deref(), Some("0xabc"));
+        assert!(view.reason.is_none());
+    }
+
+    /// A superseded drop is returned as `Ok` by the broadcaster because the slot
+    /// resolved without it — but nothing was ever sent, so it must not be
+    /// reported as a broadcast and must never carry a transaction hash.
+    #[test]
+    fn superseded_drop_is_not_reported_as_a_broadcast() {
+        let view = describe_state(JobState::Succeeded(BroadcastOutcome::Superseded {
+            nonce_seq: 7,
+        }));
+        assert_eq!(view.status, "superseded");
+        assert!(view.tx_hash.is_none(), "nothing reached the network");
+        assert!(view.reason.unwrap().contains("nonce_seq 7"));
+    }
+
+    #[test]
+    fn failed_job_reports_why() {
+        let view = describe_state(JobState::Failed(Some(error_record("broadcast failed"))));
+        assert_eq!(view.status, "failed");
+        assert_eq!(view.reason.as_deref(), Some("broadcast failed"));
+        assert!(view.tx_hash.is_none());
+    }
+
+    /// Cancellation is terminal but writes no error record, so the response has
+    /// to say something rather than leave the field empty.
+    #[test]
+    fn cancelled_job_reports_failed_with_a_reason() {
+        let view = describe_state(JobState::Failed(None));
+        assert_eq!(view.status, "failed");
+        assert_eq!(view.reason.as_deref(), Some("job was cancelled"));
+    }
+
+    /// The distinction the previous boolean flags collapsed: a job holding for a
+    /// predecessor nonce has been popped, but it is not being broadcast.
+    #[test]
+    fn nonce_hold_is_distinct_from_broadcasting() {
+        let held = describe_state(JobState::Deferred { until: 1_718_291_030 });
+        assert_eq!(held.status, "waitingForNonce");
+        assert_eq!(held.retry_after, Some(1_718_291_030));
+        assert!(held.tx_hash.is_none());
+        // The status word alone does not explain itself, so a reason is owed.
+        assert!(held.reason.unwrap().contains("predecessor sequence"));
+
+        assert_eq!(describe_state(JobState::Active).status, "broadcasting");
+        assert_eq!(describe_state(JobState::Pending).status, "pending");
+    }
+
+    /// A nack was an intent to try again; the client needs to see that the
+    /// engine kept going, and how long it waited.
+    #[test]
+    fn a_nacked_attempt_reports_as_a_retry_with_its_delay() {
+        let attempt: FailedAttempt = JobErrorRecord {
+            error: BroadcasterError("rpc timeout".to_string()),
+            attempt: 3,
+            details: JobErrorType::nack(Some(Duration::from_secs(5)), RequeuePosition::First),
+            created_at: 1_718_291_090,
+        }
+        .into();
+
+        assert_eq!(attempt.outcome, "retry");
+        assert_eq!(attempt.attempt, 3);
+        assert_eq!(attempt.at, 1_718_291_090);
+        assert_eq!(attempt.message, "rpc timeout");
+        assert_eq!(attempt.retry_delay_secs, Some(5));
+    }
+
+    /// A fail ended the job, so it must not look like something that will be
+    /// retried — and it has no next attempt to wait for.
+    #[test]
+    fn a_failed_attempt_reports_as_terminal_with_no_delay() {
+        let attempt: FailedAttempt = error_record("broadcast failed").into();
+        assert_eq!(attempt.outcome, "terminal");
+        assert_eq!(attempt.retry_delay_secs, None);
+        assert_eq!(attempt.message, "broadcast failed");
+    }
+
+    /// A nack with no delay is requeued immediately; that is not the same as a
+    /// terminal failure and must not be reported as one.
+    #[test]
+    fn an_immediate_retry_is_still_a_retry() {
+        let attempt: FailedAttempt = JobErrorRecord {
+            error: BroadcasterError("transient".to_string()),
+            attempt: 1,
+            details: JobErrorType::nack(None, RequeuePosition::Last),
+            created_at: 0,
+        }
+        .into();
+        assert_eq!(attempt.outcome, "retry");
+        assert_eq!(attempt.retry_delay_secs, None);
+    }
+
+    #[test]
+    fn retrying_job_surfaces_the_last_error() {
+        let view = describe_state(JobState::Retrying {
+            until: 1_718_291_030,
+            last_error: Some(error_record("rpc timeout")),
+        });
+        assert_eq!(view.status, "retrying");
+        assert_eq!(view.reason.as_deref(), Some("rpc timeout"));
+        assert_eq!(view.retry_after, Some(1_718_291_030));
+    }
 }
