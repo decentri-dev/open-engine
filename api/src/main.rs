@@ -6,7 +6,7 @@ use axum::{
     Json, Router,
 };
 use broadcaster::{worker::BroadcasterError, BroadcastOutcome, MempoolBroadcaster};
-use compiler::FrameCompiler;
+use compiler::{CompilerError, FrameCompiler};
 mod policy_store;
 
 use open_engine_core::{
@@ -54,9 +54,14 @@ struct ErrorBody {
 /// needs it to fix their request. `Internal` detail is logged server-side only;
 /// the client receives a generic message so infrastructure details (Redis
 /// connection strings, etc.) never leak outward.
+#[derive(Debug)]
 enum ApiError {
     BadRequest(String),
     NotFound(String),
+    /// A dependency the engine needs was unreachable, so the request was never
+    /// judged. Distinct from `BadRequest` because the caller should retry this
+    /// one unchanged rather than treat their transaction as rejected.
+    Unavailable(String),
     Internal(String),
 }
 
@@ -65,6 +70,7 @@ impl IntoResponse for ApiError {
         let (status, message) = match self {
             ApiError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
             ApiError::NotFound(message) => (StatusCode::NOT_FOUND, message),
+            ApiError::Unavailable(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
             ApiError::Internal(detail) => {
                 tracing::error!(error = %detail, "Internal error handling transaction request");
                 (
@@ -444,9 +450,18 @@ async fn handle_transaction(
         .compiler
         .compile_and_validate(payload)
         .await
-        .map_err(|e| {
-            tracing::info!("Rejected frame transaction at validation: {e}");
-            ApiError::BadRequest(e.to_string())
+        .map_err(|e| match e {
+            // The node was unreachable, so nothing about this transaction was
+            // decided. Answering 400 would tell the caller to rebuild a
+            // transaction that is very likely fine.
+            CompilerError::Unavailable(detail) => {
+                tracing::warn!("Could not reach the node to compile transaction: {detail}");
+                ApiError::Unavailable(format!("Node unreachable, retry: {detail}"))
+            }
+            other => {
+                tracing::info!("Rejected frame transaction at validation: {other}");
+                ApiError::BadRequest(other.to_string())
+            }
         })?;
 
     // 2. Enqueue under a (sender, nonce_keys, nonce_seq) identity. Each keyed slot
@@ -503,21 +518,74 @@ async fn handle_transaction(
                 &slot,
             ))
         }
-        PushOutcome::Duplicate => handle_resubmission(&state, &slot, compiled_tx).await,
+        PushOutcome::Duplicate => {
+            handle_resubmission(&state.queue, &state.tx_queued, &slot, compiled_tx).await
+        }
     }
+}
+
+/// Re-opens a slot whose previous job failed, and queues `incoming` in it.
+///
+/// The dedupe entry is what holds a finished id, so dropping it is what makes
+/// the slot pushable again; the push script then clears the old job's metadata,
+/// result and error list, so the new job starts clean rather than inheriting a
+/// terminal state.
+///
+/// Two pushes can race here. That is settled by the push itself, which is
+/// atomic: one caller creates the job and the other is told the slot is taken.
+async fn retry_failed_slot<G: ChainGateway + Send + Sync + 'static>(
+    queue: &Queue<MempoolBroadcaster<G>>,
+    queued_counter: &AtomicU64,
+    slot: &Slot,
+    incoming: FrameTransaction,
+) -> Result<(StatusCode, Json<TransactionResponse>), ApiError> {
+    queue
+        .remove_from_dedupe_set(&slot.job_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to release failed slot: {e}")))?;
+
+    let job_options = JobOptions::new(incoming).with_id(slot.job_id.clone());
+    let (_, outcome) = queue
+        .push_with_outcome(job_options)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to requeue slot {}: {e}", slot.job_id)))?;
+
+    Ok(match outcome {
+        PushOutcome::Created => {
+            queued_counter.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                job_id = %slot.job_id,
+                "Re-queued a keyed nonce slot whose previous job failed without broadcasting"
+            );
+            response(
+                StatusCode::ACCEPTED,
+                "queued",
+                "Previous attempt for this keyed nonce slot failed without broadcasting; re-queued",
+                slot,
+            )
+        }
+        // Lost the race: another request re-opened the slot first and its job is
+        // already pending. Reported as the duplicate it now is.
+        PushOutcome::Duplicate => response(
+            StatusCode::CONFLICT,
+            "duplicate",
+            "A transaction for this keyed nonce slot is already pending",
+            slot,
+        ),
+    })
 }
 
 /// A job already exists for this `(sender, nonce_keys, nonce_seq)` slot. Decide
 /// whether the incoming transaction is a valid same-sequence fee-bump
 /// replacement, a no-op duplicate, or a re-submission of an already-processed
 /// slot — and report each honestly instead of silently swallowing it.
-async fn handle_resubmission(
-    state: &AppState,
+async fn handle_resubmission<G: ChainGateway + Send + Sync + 'static>(
+    queue: &Queue<MempoolBroadcaster<G>>,
+    queued_counter: &AtomicU64,
     slot: &Slot,
     incoming: FrameTransaction,
 ) -> Result<(StatusCode, Json<TransactionResponse>), ApiError> {
-    let existing = state
-        .queue
+    let existing = queue
         .get_job(&slot.job_id)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -533,12 +601,36 @@ async fn handle_resubmission(
     };
 
     if existing.finished_at.is_some() {
-        return Ok(response(
-            StatusCode::CONFLICT,
-            "already_processed",
-            "This keyed nonce slot has already been processed",
-            slot,
-        ));
+        // A finished job is not automatically a closed slot. The queue keeps
+        // finished ids in its dedupe set (`IdempotencyMode::Permanent`), so
+        // without this split a failed job would own its slot until it was
+        // pruned — and for a caller whose nonce key is a single-use lane derived
+        // from a signed intent, that slot is unreachable forever: a new lane
+        // means a new signature, which for an m-of-n account means re-collecting
+        // every one. A node that was briefly unreachable must not cost that.
+        return match queue
+            .get_job_state(&slot.job_id)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+        {
+            // Every path that fails a job leaves the transaction unsent, or —
+            // for a node that stayed unreachable across the whole retry budget —
+            // leaves its fate unknown. Unknown is safe to retry: if the earlier
+            // attempt did reach the mempool, the node answers the re-broadcast
+            // with "already known" and the gateway resolves that to the hash it
+            // already has. So a failed slot is reusable.
+            Some(JobState::Failed(_)) => {
+                retry_failed_slot(queue, queued_counter, slot, incoming).await
+            }
+            // A slot that produced an outcome keeps it. Re-running it would
+            // either double-broadcast or overwrite a recorded result.
+            _ => Ok(response(
+                StatusCode::CONFLICT,
+                "already_processed",
+                "This keyed nonce slot has already been processed",
+                slot,
+            )),
+        };
     }
 
     if !is_valid_fee_bump(&existing.data, &incoming) {
@@ -550,8 +642,7 @@ async fn handle_resubmission(
         ));
     }
 
-    let replaced = state
-        .queue
+    let replaced = queue
         .try_replace_pending_data(&slot.job_id, &incoming)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -948,6 +1039,118 @@ mod http_tests {
             .push(JobOptions::new(frame_tx(nonce_seq)).with_id(job_id))
             .await
             .expect("push failed");
+    }
+
+    /// A queue whose node rejects every broadcast, so a job reaches a terminal
+    /// failure through the real worker and completion path.
+    async fn rejecting_queue(name: &str, onchain_nonce: u64) -> Arc<TestQueue> {
+        let gateway = Arc::new(MockGateway {
+            nonce: onchain_nonce,
+            send_error: Some(|| {
+                open_engine_core::gateway::GatewayError::RpcError(
+                    "validation prefix frame reverted".to_string(),
+                )
+            }),
+            ..Default::default()
+        });
+        let queue = Arc::new(
+            Queue::new(REDIS_URL, name, None, MempoolBroadcaster::new(gateway))
+                .await
+                .expect("Redis must be running on 127.0.0.1:6379 for this test"),
+        );
+        cleanup(&queue).await;
+        queue
+    }
+
+    fn slot_for(job_id: &str, nonce_seq: u64) -> Slot {
+        Slot {
+            job_id: job_id.to_string(),
+            sender: SENDER.to_string(),
+            nonce_keys: vec!["0".to_string()],
+            nonce_seq,
+        }
+    }
+
+    /// A failed job must not own its slot forever.
+    ///
+    /// Finished ids stay in the dedupe set, so without the explicit release a
+    /// re-submission would be answered `already_processed` until the job was
+    /// pruned. For a caller whose nonce key is a single-use lane derived from a
+    /// signed intent, that slot is the only one those signatures can ever use.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_slot_can_be_pushed_again() {
+        let queue = rejecting_queue(&unique_queue_name("retry_failed"), 5).await;
+        let app = router(queue.clone());
+
+        let job_id = "0xabc:0:5";
+        push(&queue, job_id, 5).await;
+        let worker = queue.clone().work();
+
+        let body = get_until(&app, job_id, "failed").await;
+        assert!(
+            body["reason"].as_str().unwrap().contains("reverted"),
+            "the node's reason should reach the caller: {body}"
+        );
+
+        let queued = AtomicU64::new(0);
+        let (code, response) =
+            handle_resubmission(&queue, &queued, &slot_for(job_id, 5), frame_tx(5))
+                .await
+                .expect("resubmission should be handled, not error");
+
+        assert_eq!(code, StatusCode::ACCEPTED, "got {}", response.message);
+        assert_eq!(response.status, "queued");
+        assert_eq!(queued.load(Ordering::Relaxed), 1);
+
+        // The new job must start clean rather than inherit the old terminal
+        // state: the push script clears the previous metadata, result and error
+        // list, and this is what proves it.
+        let (code, body) = fetch(&app, job_id).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_ne!(body["status"], "failed", "stale terminal state: {body}");
+        assert!(body["finishedAt"].is_null(), "stale finish time: {body}");
+        assert_eq!(
+            body["failedAttempts"].as_array().unwrap().len(),
+            0,
+            "stale error history: {body}"
+        );
+
+        worker.shutdown().await.unwrap();
+        cleanup(&queue).await;
+    }
+
+    /// The other side of the rule: a slot that actually broadcast keeps its
+    /// result. Re-opening it would either double-send or overwrite the hash the
+    /// caller is polling for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_broadcast_slot_stays_closed() {
+        let tx_hash = B256::repeat_byte(0xcd);
+        let queue = test_queue(&unique_queue_name("closed"), 5, tx_hash).await;
+        let app = router(queue.clone());
+
+        let job_id = "0xabc:0:5";
+        push(&queue, job_id, 5).await;
+        let worker = queue.clone().work();
+
+        get_until(&app, job_id, "broadcast").await;
+
+        let queued = AtomicU64::new(0);
+        let (code, response) =
+            handle_resubmission(&queue, &queued, &slot_for(job_id, 5), frame_tx(5))
+                .await
+                .expect("resubmission should be handled, not error");
+
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(response.status, "already_processed");
+        assert_eq!(queued.load(Ordering::Relaxed), 0);
+
+        // And the recorded hash survives the attempt.
+        let (_, body) = fetch(&app, job_id).await;
+        assert_eq!(body["status"], "broadcast");
+        assert_eq!(body["txHash"], tx_hash.to_string());
+
+        worker.shutdown().await.unwrap();
+        cleanup(&queue).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

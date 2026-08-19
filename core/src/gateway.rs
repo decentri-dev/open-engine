@@ -7,12 +7,72 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum GatewayError {
+    /// The node answered, and its answer was an error. The request reached the
+    /// node and was evaluated, so retrying the same bytes gets the same verdict.
     #[error("RPC error: {0}")]
     RpcError(String),
+    /// The request never got an answer: connection refused, timeout, DNS
+    /// failure, a proxy 502, malformed framing. Says nothing about the request
+    /// itself — only that the node was unreachable at that moment — so a caller
+    /// holding un-repeatable state (a single-use nonce lane) must retry rather
+    /// than treat it as a rejection.
+    #[error("transport failure reaching the node: {0}")]
+    Transport(String),
     /// The node does not expose the requested RPC method (JSON-RPC `-32601`),
     /// e.g. an ethrex node without `--http.api ethrex`, or a non-ethrex node.
     #[error("RPC method not supported by the node: {0}")]
     UnsupportedMethod(String),
+}
+
+impl GatewayError {
+    /// Whether the failure is worth retrying unchanged.
+    ///
+    /// Only [`Transport`](GatewayError::Transport) is: the other two are the
+    /// node's considered answer, and repeating the request repeats the answer.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, GatewayError::Transport(_))
+    }
+}
+
+/// Sorts an alloy RPC failure into "the node said no" and "we never reached the
+/// node".
+///
+/// `as_error_resp()` is `Some` exactly when the node returned a JSON-RPC error
+/// object, which is the only evidence that it saw and judged the request.
+/// Everything else — transport, serialization, a non-JSON body from a proxy —
+/// leaves the request's fate unknown, and unknown must not be reported as
+/// rejected.
+fn classify_rpc_error(
+    error: alloy::transports::RpcError<alloy::transports::TransportErrorKind>,
+) -> GatewayError {
+    match error.as_error_resp() {
+        // -32601 = method not found: the node has no such method. Kept separate
+        // so callers can degrade to "no preflight" instead of failing.
+        Some(resp) if resp.code == -32601 => {
+            GatewayError::UnsupportedMethod(resp.message.to_string())
+        }
+        Some(resp) => GatewayError::RpcError(resp.to_string()),
+        None => GatewayError::Transport(error.to_string()),
+    }
+}
+
+/// Node responses that mean "this exact transaction is already in the mempool".
+///
+/// Reached only after a retry: the first attempt was accepted but its response
+/// was lost, so the node now rejects the duplicate. The transaction is live, and
+/// reporting it as failed would be a lie that costs the caller a single-use
+/// nonce lane. Matched case-insensitively against the substrings geth, reth,
+/// erigon, besu and ethrex use.
+fn is_already_known(message: &str) -> bool {
+    let message = message.to_lowercase();
+    [
+        "already known",
+        "already imported",
+        "alreadyknown",
+        "known transaction",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 /// Result of `ethrex_simulateFrameTransaction`: ethrex's frame-aware dry-run of
@@ -100,6 +160,11 @@ pub trait ChainGateway: Send + Sync {
     ) -> impl Future<Output = Result<FrameSimulation, GatewayError>> + Send;
 
     /// Broadcasts the raw signed transaction bytes to the mempool.
+    ///
+    /// Succeeds when the transaction is *in* the mempool, which includes a node
+    /// answering that it already knows it — that answer means an earlier attempt
+    /// landed and only its response was lost, so it resolves to the hash rather
+    /// than to an error.
     fn send_raw_transaction(
         &self,
         bytes: Bytes,
@@ -123,7 +188,7 @@ impl ChainGateway for AlloyGateway {
         self.provider
             .get_transaction_count(address)
             .await
-            .map_err(|e| GatewayError::RpcError(e.to_string()))
+            .map_err(classify_rpc_error)
     }
 
     async fn get_keyed_nonce_seq(
@@ -150,7 +215,7 @@ impl ChainGateway for AlloyGateway {
             .provider
             .get_storage_at(manager, slot)
             .await
-            .map_err(|e| GatewayError::RpcError(e.to_string()))?;
+            .map_err(classify_rpc_error)?;
 
         // An absent slot reads as 0 (first use of the key). Sequences are uint64.
         if value > U256::from(u64::MAX) {
@@ -175,17 +240,13 @@ impl ChainGateway for AlloyGateway {
             .client()
             .request("ethrex_simulateFrameTransaction", (raw,))
             .await
-            .map_err(|e| {
-                // -32601 = method not found: the node has no `ethrex` namespace.
-                // Distinguished so callers can degrade to "no preflight" instead
-                // of rejecting every transaction.
-                if e.as_error_resp().is_some_and(|resp| resp.code == -32601) {
-                    GatewayError::UnsupportedMethod(
-                        "ethrex_simulateFrameTransaction".to_string(),
-                    )
-                } else {
-                    GatewayError::RpcError(e.to_string())
+            .map_err(|e| match classify_rpc_error(e) {
+                // Report the method by name rather than the node's phrasing, so
+                // the log says which capability is missing.
+                GatewayError::UnsupportedMethod(_) => {
+                    GatewayError::UnsupportedMethod("ethrex_simulateFrameTransaction".to_string())
                 }
+                other => other,
             })?;
 
         // The node answers `null` only when the requested block is unknown;
@@ -198,17 +259,34 @@ impl ChainGateway for AlloyGateway {
     }
 
     async fn send_raw_transaction(&self, bytes: Bytes) -> Result<B256, GatewayError> {
+        // The frame transaction hash is keccak256 over the same canonical bytes
+        // the node hashes, so it is derivable locally — needed below, where the
+        // node declines to return it.
+        let local_hash = keccak256(&bytes);
+
         // Alloy doesn't expose send_raw_transaction with arbitrary bytes on the
         // root provider without building a tx envelope, so the raw RPC client
         // sends the bytes directly.
-        let hash = self
+        match self
             .provider
             .client()
-            .request("eth_sendRawTransaction", (bytes,))
+            .request::<_, B256>("eth_sendRawTransaction", (bytes,))
             .await
-            .map_err(|e| GatewayError::RpcError(e.to_string()))?;
-
-        Ok(hash)
+        {
+            Ok(hash) => Ok(hash),
+            Err(e) => match classify_rpc_error(e) {
+                GatewayError::RpcError(message) if is_already_known(&message) => {
+                    tracing::info!(
+                        tx_hash = %local_hash,
+                        node_message = %message,
+                        "Node reports this transaction is already in its mempool; \
+                         treating as broadcast (a prior attempt landed and its response was lost)"
+                    );
+                    Ok(local_hash)
+                }
+                other => Err(other),
+            },
+        }
     }
 }
 
@@ -223,6 +301,13 @@ pub struct MockGateway {
     pub nonce: u64,
     pub gas_limit: u64,
     pub tx_hash: B256,
+    /// When set, `send_raw_transaction` returns this instead of `tx_hash`. Lets
+    /// a test drive the caller's transport-vs-rejection split, which is the
+    /// whole difference between retrying a broadcast and burning a nonce lane.
+    pub send_error: Option<fn() -> GatewayError>,
+    /// When set, the nonce reads fail with this. Separate from `send_error` so a
+    /// test can make reconciliation fail while broadcasting would have worked.
+    pub nonce_error: Option<fn() -> GatewayError>,
 }
 
 #[cfg(feature = "test-utils")]
@@ -232,6 +317,8 @@ impl Default for MockGateway {
             nonce: 0,
             gas_limit: 21000,
             tx_hash: B256::ZERO,
+            send_error: None,
+            nonce_error: None,
         }
     }
 }
@@ -239,7 +326,10 @@ impl Default for MockGateway {
 #[cfg(feature = "test-utils")]
 impl ChainGateway for MockGateway {
     async fn get_transaction_count(&self, _address: Address) -> Result<u64, GatewayError> {
-        Ok(self.nonce)
+        match self.nonce_error {
+            Some(make) => Err(make()),
+            None => Ok(self.nonce),
+        }
     }
 
     async fn get_keyed_nonce_seq(
@@ -247,7 +337,10 @@ impl ChainGateway for MockGateway {
         _sender: Address,
         _nonce_key: U256,
     ) -> Result<u64, GatewayError> {
-        Ok(self.nonce)
+        match self.nonce_error {
+            Some(make) => Err(make()),
+            None => Ok(self.nonce),
+        }
     }
 
     async fn simulate_frame_transaction(
@@ -268,7 +361,10 @@ impl ChainGateway for MockGateway {
     }
 
     async fn send_raw_transaction(&self, _bytes: Bytes) -> Result<B256, GatewayError> {
-        Ok(self.tx_hash)
+        match self.send_error {
+            Some(make) => Err(make()),
+            None => Ok(self.tx_hash),
+        }
     }
 }
 
@@ -281,6 +377,36 @@ mod tests {
     fn gateway_connection() {
         let url = "http://localhost:8545".parse().unwrap();
         let _p: RootProvider<Ethereum> = RootProvider::new_http(url);
+    }
+
+    #[test]
+    fn only_transport_failures_are_retryable() {
+        use super::GatewayError;
+
+        assert!(GatewayError::Transport("connection refused".into()).is_transient());
+        // A rejection is the node's verdict; repeating the request repeats it.
+        assert!(!GatewayError::RpcError("nonce too low".into()).is_transient());
+        assert!(!GatewayError::UnsupportedMethod("debug_traceCall".into()).is_transient());
+    }
+
+    #[test]
+    fn already_known_is_recognized_across_client_phrasings() {
+        use super::is_already_known;
+
+        // The phrasings actually seen in the wild, plus case-insensitivity:
+        // this is the difference between reporting a live transaction as
+        // broadcast and reporting it as failed.
+        assert!(is_already_known("already known"));
+        assert!(is_already_known("ALREADY KNOWN"));
+        assert!(is_already_known("txpool: transaction already imported"));
+        assert!(is_already_known("known transaction: 0xabc"));
+        assert!(is_already_known("AlreadyKnown"));
+
+        // A rejection that merely mentions a neighbouring word must not be
+        // mistaken for success.
+        assert!(!is_already_known("nonce too low"));
+        assert!(!is_already_known("known accounts do not include sender"));
+        assert!(!is_already_known("validation prefix frame reverted"));
     }
 
     /// Live round-trip of `simulate_frame_transaction`: the engine's canonical encoding

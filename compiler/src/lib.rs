@@ -18,10 +18,30 @@ pub enum CompilerError {
     Validation(String),
     #[error("Simulation failed: {0}")]
     Simulation(String),
+    /// The node could not be reached, so the transaction was never judged.
+    /// Distinct from [`Simulation`](CompilerError::Simulation), which is the
+    /// node's verdict: this one says nothing about the transaction and the
+    /// caller should retry it unchanged.
+    #[error("Node unreachable: {0}")]
+    Unavailable(String),
     #[error("Failed to sign frame: {0}")]
     Signing(String),
     #[error("Sponsor policy rejected the transaction: {0}")]
     Policy(String),
+}
+
+/// Maps a gateway failure onto the compiler's own error split, preserving the
+/// difference between "the node said no" and "we never reached the node".
+///
+/// Collapsing the two makes an outage look like a malformed transaction, which
+/// tells the caller to fix something that is not broken — and, for a caller
+/// holding signatures over a single-use nonce lane, to throw them away.
+fn classify_gateway_error(error: GatewayError) -> CompilerError {
+    if error.is_transient() {
+        CompilerError::Unavailable(error.to_string())
+    } else {
+        CompilerError::Simulation(error.to_string())
+    }
 }
 
 /// The Compiler acts as the gateway between the API and the Queue.
@@ -363,7 +383,7 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
                 .gateway
                 .get_keyed_nonce_seq(sender, key)
                 .await
-                .map_err(|e| CompilerError::Simulation(e.to_string()))?;
+                .map_err(classify_gateway_error)?;
             if seq < current {
                 return Err(CompilerError::Simulation(format!(
                     "nonce_seq {seq} is already behind key {key} (current sequence {current}); the transaction can never become executable"
@@ -394,7 +414,7 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
                 );
                 return Ok(());
             }
-            Err(e) => return Err(CompilerError::Simulation(e.to_string())),
+            Err(e) => return Err(classify_gateway_error(e)),
         };
 
         if !sim.valid {

@@ -16,6 +16,7 @@ async fn compiles_and_queues_self_relay_tx() {
         nonce: 42,
         gas_limit: 21000,
         tx_hash: B256::repeat_byte(0xaa),
+        ..Default::default()
     });
 
     // Use a dummy key for the sponsor signer
@@ -97,6 +98,7 @@ async fn compiles_and_queues_sponsored_tx() {
         nonce: 100,
         gas_limit: 50000,
         tx_hash: B256::repeat_byte(0xbb),
+        ..Default::default()
     });
 
     // The Compiler's key (acts as Paymaster sponsor)

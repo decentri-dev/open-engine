@@ -20,6 +20,23 @@ pub const NONCE_HOLD_RETRY_SECS: u64 = 6;
 /// the per-sender slot indefinitely.
 pub const MAX_NONCE_HOLD_SECS: u64 = 300;
 
+/// How long to wait before retrying a broadcast that never reached the node.
+pub const BROADCAST_RETRY_SECS: u64 = 5;
+
+/// How many attempts a broadcast may burn on an unreachable node before the job
+/// is failed. With [`BROADCAST_RETRY_SECS`] between attempts this is roughly two
+/// minutes of tolerated outage.
+///
+/// The retry exists because a transport failure says nothing about the
+/// transaction, and the caller's nonce lane may be single-use: failing on the
+/// first blip would spend a lane that never reached the mempool. The bound
+/// exists because a node that is down for good must not pin the slot forever.
+///
+/// Counted in attempts rather than wall clock because a job may sit in the
+/// nonce hold for minutes first, and a `Defer` deliberately does not count as an
+/// attempt — so this budget measures real tries, not time spent waiting.
+pub const MAX_BROADCAST_ATTEMPTS: u32 = 24;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BroadcasterError(pub String);
 
@@ -290,6 +307,42 @@ impl<G: ChainGateway + Send + Sync + 'static> DurableExecution for MempoolBroadc
 
         let tx_hash = match self.gateway.send_raw_transaction(bytes).await {
             Ok(hash) => hash,
+            // The node was never reached, so the transaction's fate is unknown
+            // and its nonce lane is untouched. Retry rather than fail: a lane
+            // may be single-use, and burning one on an unreachable node would
+            // cost the caller a transaction it can never re-sign.
+            Err(e) if e.is_transient() => {
+                let attempts = job.attempts();
+
+                if attempts >= MAX_BROADCAST_ATTEMPTS {
+                    error!(
+                        job_id = %job.id(),
+                        sender = %sender,
+                        error = %e,
+                        attempts,
+                        "Node unreachable across the full broadcast attempt budget; failing job"
+                    );
+                    return Err(queue::job::JobError::Fail(BroadcasterError(format!(
+                        "Node unreachable after {attempts} attempts: {e}"
+                    ))));
+                }
+
+                warn!(
+                    job_id = %job.id(),
+                    sender = %sender,
+                    error = %e,
+                    attempts,
+                    retry_delay_secs = BROADCAST_RETRY_SECS,
+                    "Broadcast did not reach the node; requeueing (the transaction was never sent)"
+                );
+                return Err(queue::job::JobError::Nack {
+                    error: BroadcasterError(format!("Broadcast unreachable: {e}")),
+                    delay: Some(Duration::from_secs(BROADCAST_RETRY_SECS)),
+                    position: RequeuePosition::First,
+                });
+            }
+            // The node answered, and the answer was no. Retrying the same bytes
+            // gets the same verdict, so this is terminal.
             Err(e) => {
                 // Best-effort diagnosis: re-run the frame-aware simulation so
                 // the job error carries the node's actual rejection reason
@@ -384,17 +437,99 @@ mod tests {
     }
 
     fn job(tx: FrameTransaction, created_at: u64) -> BorrowedJob<FrameTransaction> {
+        job_with_attempts(tx, created_at, 1)
+    }
+
+    fn job_with_attempts(
+        tx: FrameTransaction,
+        created_at: u64,
+        attempts: u32,
+    ) -> BorrowedJob<FrameTransaction> {
         BorrowedJob::new(
             Job {
                 id: format!("{SENDER}:{}", tx.nonce_seq.unwrap_or_default()),
                 data: tx,
-                attempts: 1,
+                attempts,
                 created_at,
                 processed_at: Some(created_at),
                 finished_at: None,
             },
             "test-lease".to_string(),
         )
+    }
+
+    /// A broadcaster whose nonce reads succeed but whose broadcast fails with
+    /// `error`. The nonce must still reconcile, or the job would never reach the
+    /// broadcast step being tested.
+    fn broadcaster_failing_send(
+        onchain_nonce: u64,
+        error: fn() -> open_engine_core::gateway::GatewayError,
+    ) -> MempoolBroadcaster<MockGateway> {
+        MempoolBroadcaster::new(Arc::new(MockGateway {
+            nonce: onchain_nonce,
+            send_error: Some(error),
+            ..Default::default()
+        }))
+    }
+
+    // The transaction never reached the node, so its nonce lane is untouched.
+    // Failing here would end a job that was never sent — and when the lane is
+    // single-use and derived from a signed intent, the signatures die with it.
+    #[tokio::test]
+    async fn unreachable_node_requeues_instead_of_failing() {
+        let broadcaster = broadcaster_failing_send(5, || {
+            open_engine_core::gateway::GatewayError::Transport("connection refused".to_string())
+        });
+
+        match broadcaster.process(&job(sample_tx(Some(5)), now())).await {
+            Err(JobError::Nack { error, delay, .. }) => {
+                assert!(
+                    error.0.contains("connection refused"),
+                    "the node's transport error should survive into the job record, got {}",
+                    error.0
+                );
+                assert_eq!(delay, Some(Duration::from_secs(BROADCAST_RETRY_SECS)));
+            }
+            other => panic!("expected a nack for an unreachable node, got {other:?}"),
+        }
+    }
+
+    // The retry is bounded: a node that is down for good must not pin the slot.
+    #[tokio::test]
+    async fn unreachable_node_fails_once_the_attempt_budget_is_spent() {
+        let broadcaster = broadcaster_failing_send(5, || {
+            open_engine_core::gateway::GatewayError::Transport("connection refused".to_string())
+        });
+        let job = job_with_attempts(sample_tx(Some(5)), now(), MAX_BROADCAST_ATTEMPTS);
+
+        match broadcaster.process(&job).await {
+            Err(JobError::Fail(error)) => assert!(
+                error.0.contains("unreachable"),
+                "the failure should name the cause, got {}",
+                error.0
+            ),
+            other => panic!("expected a terminal failure past the budget, got {other:?}"),
+        }
+    }
+
+    // The mirror image: the node answered, and the answer was no. Retrying the
+    // same signed bytes gets the same answer, so this one is terminal.
+    #[tokio::test]
+    async fn node_rejection_fails_without_retrying() {
+        let broadcaster = broadcaster_failing_send(5, || {
+            open_engine_core::gateway::GatewayError::RpcError(
+                "validation prefix frame reverted".to_string(),
+            )
+        });
+
+        match broadcaster.process(&job(sample_tx(Some(5)), now())).await {
+            Err(JobError::Fail(error)) => assert!(
+                error.0.contains("validation prefix frame reverted"),
+                "the node's reason should reach the caller, got {}",
+                error.0
+            ),
+            other => panic!("expected a terminal failure for a rejection, got {other:?}"),
+        }
     }
 
     #[tokio::test]

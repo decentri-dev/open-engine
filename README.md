@@ -152,11 +152,11 @@ curl http://localhost:3001/transaction/0x111111111111111111111111111111111111111
 | --- | --- |
 | `pending` | Queued, not yet picked up by a worker. |
 | `waitingForNonce` | Valid, but a selected key's predecessor sequence has not landed on-chain. Held and re-checked; `retryAfter` gives the next check. Bounded by `MAX_NONCE_HOLD_SECS` (300s), after which the job fails. |
-| `retrying` | An attempt failed and the job is backing off. `reason` carries the last error, `retryAfter` the next attempt. |
+| `retrying` | An attempt failed and the job is backing off. `reason` carries the last error, `retryAfter` the next attempt. A node that could not be reached lands here, not in `failed`. |
 | `broadcasting` | A worker holds a lease and is broadcasting now. |
 | `broadcast` | The node accepted the raw transaction and returned `txHash`. **Terminal.** |
 | `superseded` | A selected key advanced past `nonce_seq`, so the transaction can never be valid. Dropped without being sent. **Terminal.** |
-| `failed` | Permanently rejected or cancelled; `reason` says why. **Terminal.** |
+| `failed` | The node rejected the transaction, or it was cancelled, or the node stayed unreachable across the whole retry budget; `reason` says which. **Terminal**, but the slot is reusable — see below. |
 
 Other fields:
 
@@ -169,7 +169,19 @@ Other fields:
 
 **`broadcast` is not confirmation.** The engine hands off at the mempool and never watches for a receipt. Take `txHash` to an RPC node and call `eth_getTransactionReceipt` for inclusion.
 
-Job ids are not permanently unique. A slot becomes re-pushable once its previous job is pruned, and a re-push starts clean — the earlier run's result and history are discarded.
+Job ids are not permanently unique, and a re-push starts clean — the earlier run's result and history are discarded.
+
+A slot becomes re-pushable in two cases: once its previous job is pruned, or as soon as that job **failed**. The second case exists because a failed job never put a transaction in the mempool, so its nonce slot is still spendable — and for a caller whose nonce key is a single-use lane derived from a signed intent, that slot is the only one those signatures can ever use. Holding it shut until a prune would turn a brief node outage into re-collecting every signature. A slot that reached `broadcast` or `superseded` stays shut: it has a result worth keeping.
+
+### Retries and what they protect
+
+The engine separates *the node said no* from *we never reached the node*, and only the second is retried.
+
+A rejection is the node's verdict on the exact signed bytes; sending them again gets the same verdict, so the job fails immediately with the node's reason. A transport failure — connection refused, a timeout, a proxy 502 — says nothing about the transaction and leaves its nonce lane untouched, so the broadcast is requeued (every `BROADCAST_RETRY_SECS`, up to `MAX_BROADCAST_ATTEMPTS`) rather than spending a lane that was never used.
+
+One consequence is worth naming: if a broadcast *did* reach the mempool but its response was lost, the retry finds the node answering "already known". That is not a failure — the transaction is live — so the engine resolves it to the transaction hash, which it can compute locally from the same canonical bytes the node hashes, and reports the job as `broadcast`.
+
+The same split applies at intake. `POST /transaction` answers `400` when the compiler or the node rejects a transaction, and `503` when the node could not be reached at all — the second means retry the request unchanged.
 
 ## Running Tests
 
