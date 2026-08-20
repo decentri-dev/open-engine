@@ -45,7 +45,7 @@ async fn end_to_end_flow() {
 
     // 4.5. Resolve the sender's live executable sequence for the legacy nonce key
     // (key 0). This is a long-running devnet, so the account has already sent
-    // transactions; hardcoding 0 would be rejected by the preflight as behind the
+    // transactions; hardcoding 0 would be rejected by the simulation as behind the
     // current sequence. `nonce_seq` is part of the signed hash, so it must be
     // fixed before signing below.
     let nonce_seq = gateway

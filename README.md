@@ -6,8 +6,8 @@ A Rust transaction handling engine focused on compiling and broadcasting EIP-814
 
 The `open-engine` workspace is composed of five primary modules operating synchronously through a Redis-backed State Machine:
 
-1. **`api`**: The ingress layer built with Axum. It receives strictly structured EIP-8141 Frame Transaction payloads, passes them through the **Compiler**, and queues them. It also initializes and hosts the background worker loop.
-2. **`compiler`**: The validation and enhancement layer. It enforces EIP-8141 frame structure, injects Canonical Paymaster signatures when sponsorship is requested, and preflights the transaction through the chain gateway using the node's frame-aware `ethrex_simulateFrameTransaction` RPC.
+1. **`api`**: The intake layer built with Axum. It receives strictly structured EIP-8141 Frame Transaction payloads, passes them through the **Compiler**, and queues them. It also initializes and hosts the background worker loop.
+2. **`compiler`**: The validation and enhancement layer. It enforces EIP-8141 frame structure, injects Canonical Paymaster signatures when sponsorship is requested, and simulates the transaction through the chain gateway using the node's frame-aware `ethrex_simulateFrameTransaction` RPC.
 3. **`queue`**: The Redis-backed State Machine layer. It acts as the concurrency and storage layer used exclusively by the engine to track queue states, retries, idempotency, leases, and crash-recovery logs.
 4. **`broadcaster`**: The component that receives jobs from the queue, reconciles the on-chain nonce, encodes the finalized EIP-8141 Frame Transaction, and submits it to the network.
 5. **`core`** (crate: `open_engine_core`): Shared domain, encoding, signer, and chain gateway primitives used by the API, Compiler, and Broadcaster.
@@ -44,6 +44,26 @@ The `open-engine` workspace is composed of five primary modules operating synchr
    The `MAX_VERIFY_GAS` admission budget is a fixed constant that mirrors the
    network's mempool policy (see `open_engine_core::domain::MAX_VERIFY_GAS`);
    it is deliberately not configurable per instance.
+
+   `RPC_URL` accepts a comma-separated list of endpoints in priority order:
+
+   ```bash
+   export RPC_URL=http://primary:8545,http://standby:8545
+   ```
+
+   The engine prefers the first entry and moves to the next only when an
+   endpoint fails to *answer* — a refused connection, a node missing the
+   frame-aware simulation RPC, or a simulator declining to run a request. A
+   node's verdict on a transaction is never retried elsewhere: every node
+   judging the same bytes reaches the same conclusion, so re-asking would turn
+   one rejection into one per endpoint.
+
+   Calls stay on the endpoint that last answered rather than restarting from the
+   head of the list, because the engine reads nonce state and then broadcasts
+   against it, and endpoints at different heights disagree about that state.
+   There is no health polling and no automatic return to a higher-priority
+   endpoint; the list is re-entered from the top when the current endpoint stops
+   answering.
 
 #### Sponsor signer (`SPONSOR_SIGNER`)
 
