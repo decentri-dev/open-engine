@@ -94,11 +94,76 @@ deployment decision, not a code change:
 | `raw` | `raw:0xabc…` | Loads the key into process memory. Dev/local only; warns at boot. |
 | `aws-kms` | `aws-kms:alias/sponsor?region=eu-west-1` | Key stays in AWS KMS. Build with `--features signer-aws`. |
 | `gcp-kms` | `gcp-kms:projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1` | Key stays in GCP Cloud KMS. Build with `--features signer-gcp`. |
+| `https` / `http` | `https://sponsor.example.com/sign?address=0xABC…` | An external authority decides per request. No feature flag — it speaks HTTP, not a vendor SDK. |
 
 KMS backends are off by default, so a plain build pulls in no cloud SDK:
 ```bash
 cargo run -p api --features signer-aws          # or signer-gcp, or both
 ```
+
+#### Sponsor authority (`https:` signer)
+
+The other backends hold a key and sign whatever they are handed; the decision was
+made upstream by the sponsor policy. An `https:` signer inverts that: the engine
+posts the transaction to an endpoint you run, and you decide.
+
+```bash
+export SPONSOR_SIGNER='https://sponsor.example.com/sign?address=0xABC…'
+export SPONSOR_SIGNER_TOKEN=…        # sent as `Authorization: Bearer …`
+```
+
+`address` is required — it is the address your signatures recover to, and the
+engine matches it against the pay frame's target to decide the frame is yours at
+all. `timeout_ms` is optional (default 5000).
+
+**Request** — `POST` to the configured URL:
+
+```json
+{
+  "sigHash": "0x…",
+  "sponsor": "0xabc…",
+  "transaction": { "sender": "0x…", "frames": [ … ], "…": "…" }
+}
+```
+
+**Response** — approve with `200` and the 65-byte `v || r || s` signature:
+
+```json
+{ "signature": "0x…" }
+```
+
+Refuse with any `4xx`, optionally explaining why in `error` or `reason`. The
+engine passes that reason back to the caller.
+
+| Your answer | Engine's reading | Caller sees |
+| --- | --- | --- |
+| `2xx` + signature | approved | transaction is queued |
+| `4xx` | refused — a verdict on these bytes | `400`, with your reason |
+| `5xx`, timeout, connection refused | no verdict was reached | `503`, retry unchanged |
+
+That last row is the one worth getting right in your endpoint. A `4xx` is
+terminal: the engine will not retry, because asking again about the same
+transaction gets the same answer. A `5xx` says you never decided, so the request
+is retryable and the caller's nonce lane is untouched. Returning `4xx` for an
+internal fault would turn your own outage into a permanent rejection — and for a
+caller whose nonce key is a single-use lane derived from a signed intent, into
+re-collecting every signature.
+
+**Why this rather than a webhook that returns yes/no.** Both give you arbitrary
+logic over your own data. The difference is that a refusal here is enforced by
+the absence of a signature rather than by the engine's cooperation — you are not
+trusting open-engine to honour a "no". That is the whole reason to run one.
+
+**What it costs.** A network call in the compile path, ahead of simulation, and a
+dependency whose outage means nothing gets sponsored. The engine still starts
+when the endpoint is down (see below) and unsponsored traffic is unaffected.
+
+At boot the engine sends one probe with `"transaction": null`. An authority that
+decides cannot decide on a contextless digest, so **refusing the probe is the
+expected, healthy answer** — it proves the endpoint is reachable and
+authenticating without asking for a real signature. An unreachable endpoint warns
+but does not stop startup: relay and self-paid traffic need no sponsor, and
+sponsored requests answer `503` until it returns.
 
 #### Deployment posture and sponsor policy
 
@@ -109,6 +174,11 @@ cargo run -p api --features signer-aws          # or signer-gcp, or both
 - `public` — open-engine is the untrusted-facing entry point. Policy is the only
   thing protecting sponsor funds, so boot **fails closed** unless the policy bounds
   both spend and admission.
+
+These guards are a fixed vocabulary evaluated against state the engine can see.
+They are not a substitute for a [sponsor authority](#sponsor-authority-https-signer)
+and an authority does not replace them: the authority expresses your product
+logic, the guards bound the damage regardless of what it approves.
 
 Policy guards (all optional in `gated`, required as noted in `public`):
 

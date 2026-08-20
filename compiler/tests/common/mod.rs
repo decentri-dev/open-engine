@@ -1,3 +1,7 @@
+// A shared fixtures module: each test binary includes the whole file but uses
+// only the parts it needs, so unused items here are expected rather than dead.
+#![allow(dead_code)]
+
 /// Shared in-memory gateway double, defined in core (`test-utils` feature) so
 /// the compiler and broadcaster test suites exercise the same behavior.
 pub use open_engine_core::gateway::MockGateway;

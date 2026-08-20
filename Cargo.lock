@@ -3465,6 +3465,7 @@ name = "open_engine_core"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

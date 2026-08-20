@@ -13,7 +13,7 @@ use open_engine_core::{
     domain::FrameTransaction,
     gateway::{AlloyGateway, ChainGateway, FailoverGateway},
     policy::{Posture, PolicyStore, SponsorPolicy},
-    signer::{Signer, SponsorSigner},
+    signer::{Signer, SignerError, SponsorSigner},
 };
 use policy_store::RedisPolicyStore;
 use std::collections::HashSet;
@@ -455,12 +455,14 @@ async fn handle_transaction(
         .compile_and_validate(payload)
         .await
         .map_err(|e| match e {
-            // The node was unreachable, so nothing about this transaction was
+            // Something the compiler depends on — the node, or a remote sponsor
+            // authority — was unreachable, so nothing about this transaction was
             // decided. Answering 400 would tell the caller to rebuild a
-            // transaction that is very likely fine.
+            // transaction that is very likely fine. The detail names which one,
+            // so the message stays neutral about it.
             CompilerError::Unavailable(detail) => {
-                tracing::warn!("Could not reach the node to compile transaction: {detail}");
-                ApiError::Unavailable(format!("Node unreachable, retry: {detail}"))
+                tracing::warn!("Could not reach a dependency to compile transaction: {detail}");
+                ApiError::Unavailable(format!("Unreachable, retry unchanged: {detail}"))
             }
             other => {
                 tracing::info!("Rejected frame transaction at validation: {other}");
@@ -721,12 +723,37 @@ async fn build_sponsor_signer() -> Option<SponsorSigner> {
     // GetPublicKey grant, whereas signing needs a separate Sign permission — this
     // surfaces that misconfiguration at startup instead of on the first sponsored
     // transaction. The digest is a throwaway constant and nothing is broadcast.
+    //
+    // The probe carries no transaction, so for a remote authority the two
+    // non-signature outcomes are both informative rather than fatal, and neither
+    // is a reason to keep the engine down:
+    //
+    // - A refusal is the *correct* answer. An authority that decides cannot
+    //   decide on a contextless digest, and refusing proves the endpoint is
+    //   reachable and authenticating — a better health check than a signature.
+    // - An outage is the sponsor's, not this engine's. Failing to boot would turn
+    //   a dependency blip into a hard outage for relay and self-paid traffic that
+    //   needs no sponsor at all; sponsored requests already answer 503 and retry.
     match signer.sign_hash(&alloy::primitives::B256::ZERO).await {
         Ok(sig) if sig.len() == 65 => {}
         Ok(sig) => panic!(
             "Sponsor signer produced a malformed signature ({} bytes, expected 65); refusing to start",
             sig.len()
         ),
+        Err(SignerError::Refused(reason)) => {
+            tracing::info!(
+                reason = %reason,
+                "Sponsor authority declined the boot probe, which is the expected answer to a \
+                 contextless digest; endpoint is reachable and authenticating"
+            );
+        }
+        Err(SignerError::Unavailable(detail)) => {
+            tracing::warn!(
+                detail = %detail,
+                "Sponsor authority could not be reached at boot. Starting anyway: unsponsored \
+                 traffic is unaffected, and sponsored requests answer 503 until it returns."
+            );
+        }
         Err(e) => panic!(
             "Sponsor signer failed a boot-time test sign (for a KMS key, verify the Sign permission is granted, not just GetPublicKey): {e}"
         ),
@@ -735,7 +762,7 @@ async fn build_sponsor_signer() -> Option<SponsorSigner> {
     tracing::info!(
         sponsor_address = %signer.address(),
         signer = ?signer,
-        "Sponsor signer initialized (boot-time test sign OK)"
+        "Sponsor signer initialized"
     );
     Some(signer)
 }

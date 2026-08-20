@@ -7,7 +7,7 @@ use open_engine_core::domain::{
 use open_engine_core::encoding::Eip8141Encoder;
 use open_engine_core::gateway::{ChainGateway, Execution, GatewayError, PrefixOutcome};
 use open_engine_core::policy::SponsorPolicy;
-use open_engine_core::signer::Signer;
+use open_engine_core::signer::{Signer, SignerError};
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{info, warn};
@@ -93,6 +93,23 @@ fn classify_gateway_error(error: GatewayError) -> CompilerError {
         CompilerError::Unavailable(error.to_string())
     } else {
         CompilerError::Simulation(error.to_string())
+    }
+}
+
+/// Maps a signing failure onto the compiler's error split.
+///
+/// A sponsor that refuses has judged this transaction, so it is terminal and
+/// belongs with the other policy rejections — an external authority saying no is
+/// the same act as the local policy saying no, just expressed by withholding a
+/// signature instead of returning an error. A sponsor that could not be reached
+/// has judged nothing, so it degrades exactly like an unreachable node: retry the
+/// request unchanged rather than tell the caller to rebuild a transaction that
+/// was never refused.
+fn classify_signer_error(error: SignerError) -> CompilerError {
+    match error {
+        SignerError::Refused(detail) => CompilerError::Policy(detail),
+        SignerError::Unavailable(detail) => CompilerError::Unavailable(detail),
+        other => CompilerError::Signing(other.to_string()),
     }
 }
 
@@ -773,10 +790,14 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
         // Compute hash BEFORE mutating signatures (signature bytes are elided
         // from the canonical hash, so filling the placeholder does not change it).
         let sig_hash = Eip8141Encoder::compute_sig_hash(tx);
+
+        // The transaction travels with the digest. A key held locally ignores it;
+        // an external authority needs it, because a digest says nothing about who
+        // is being sponsored or for how much, and deciding is its whole purpose.
         let signature = signer
-            .sign_hash(&sig_hash)
+            .sign_sponsor_frame(tx, &sig_hash)
             .await
-            .map_err(|e| CompilerError::Signing(e.to_string()))?;
+            .map_err(classify_signer_error)?;
 
         // Fill the existing placeholder entry (matched by the sponsor address) rather
         // than pushing a new one, so the RLP signature list — and thus the

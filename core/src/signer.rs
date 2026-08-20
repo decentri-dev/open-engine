@@ -1,3 +1,4 @@
+use crate::domain::FrameTransaction;
 use alloy::primitives::{Address, Bytes, B256};
 use alloy::signers::{local::PrivateKeySigner, Signer as AlloySigner};
 use std::future::Future;
@@ -9,6 +10,17 @@ pub enum SignerError {
     SignError(String),
     #[error("Failed to initialize signer: {0}")]
     InitError(String),
+    /// A remote sponsor authority judged the request and declined to sign.
+    ///
+    /// The same distinction the engine draws for nodes: this is a verdict, so
+    /// asking again with the same transaction gets the same answer. Terminal.
+    #[error("Sponsor declined to sign: {0}")]
+    Refused(String),
+    /// A remote sponsor authority could not be reached, so it never judged the
+    /// request. The absence of a verdict is not a refusal — the caller should
+    /// retry unchanged.
+    #[error("Sponsor authority unreachable: {0}")]
+    Unavailable(String),
 }
 
 /// Generic trait abstracting transaction signing.
@@ -25,6 +37,27 @@ pub trait Signer: Send + Sync {
     /// Cached at construction, so this is cheap and infallible. The compiler
     /// uses it to sign *only* paymaster frames this signer actually owns.
     fn address(&self) -> Address;
+
+    /// Approve payment for `tx` by signing `hash` as the sponsor.
+    ///
+    /// A digest is opaque: nothing about `hash` says who is being sponsored or
+    /// for how much. A backend that holds the key locally does not care — it
+    /// signs whatever it is handed, and the decision was made upstream by
+    /// [`SponsorPolicy`](crate::policy::SponsorPolicy). A backend that is an
+    /// external authority does care, because its whole purpose is to decide, so
+    /// the transaction travels with the digest and refusing to sign *is* the
+    /// refusal.
+    ///
+    /// Defaults to [`sign_hash`](Signer::sign_hash), so key-holding backends
+    /// need not implement it.
+    fn sign_sponsor_frame(
+        &self,
+        tx: &FrameTransaction,
+        hash: &B256,
+    ) -> impl Future<Output = Result<Bytes, SignerError>> + Send {
+        let _ = tx;
+        self.sign_hash(hash)
+    }
 }
 
 /// Re-encodes an alloy signature (`r || s || v`) into the EIP-8141 frame
@@ -96,6 +129,200 @@ impl AlloyAdapter<PrivateKeySigner> {
     }
 }
 
+/// Default seconds to wait for a sponsor authority's verdict.
+const REMOTE_SIGNER_DEFAULT_TIMEOUT_SECS: u64 = 5;
+
+/// A sponsor whose key and decision both live outside this process.
+///
+/// The engine posts the transaction and its `sig_hash` to an endpoint the tenant
+/// runs; the tenant applies whatever logic it likes — subscription state, a risk
+/// model, a spend rule the engine's config vocabulary cannot express — and either
+/// returns a signature or refuses.
+///
+/// This is a policy mechanism, not only a custody one. [`SponsorPolicy`] is a
+/// fixed set of guards the operator configures, evaluated against state the
+/// engine can see. An authority here is an arbitrary function evaluated against
+/// state the engine cannot see, and its refusal is enforced by the absence of a
+/// signature rather than by the engine's cooperation. That is the difference
+/// between asking permission and needing it.
+///
+/// [`SponsorPolicy`]: crate::policy::SponsorPolicy
+pub struct RemoteSigner {
+    url: String,
+    address: Address,
+    bearer_token: Option<String>,
+    client: reqwest::Client,
+}
+
+/// What the engine sends the authority.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SignRequest<'a> {
+    /// The EIP-8141 canonical signature hash to sign.
+    sig_hash: String,
+    /// The address the signature must recover to.
+    sponsor: String,
+    /// The transaction being sponsored. `None` only for the boot-time probe,
+    /// which asks nothing of the authority except that it answer.
+    transaction: Option<&'a FrameTransaction>,
+}
+
+/// What the authority sends back when it approves.
+#[derive(serde::Deserialize)]
+struct SignResponse {
+    /// 65 raw bytes as `v || r || s`, hex, with or without `0x`.
+    signature: String,
+}
+
+/// An authority's explanation when it declines. Optional — a bare 4xx is a
+/// complete refusal on its own.
+#[derive(serde::Deserialize)]
+struct RefusalBody {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+impl RemoteSigner {
+    /// Builds an authority-backed signer.
+    ///
+    /// `address` is configuration rather than something discovered, so a
+    /// misconfigured endpoint cannot quietly become the sponsor of record: the
+    /// compiler matches this address against the pay frame's target, and a
+    /// signature that recovers to anything else fails at the node.
+    pub fn new(
+        url: String,
+        address: Address,
+        bearer_token: Option<String>,
+        timeout_secs: u64,
+    ) -> Result<Self, SignerError> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| SignerError::InitError(format!("could not build HTTP client: {e}")))?;
+
+        Ok(Self {
+            url,
+            address,
+            bearer_token,
+            client,
+        })
+    }
+
+    /// Asks the authority to approve `transaction` by signing `hash`.
+    ///
+    /// The reject/decline split the engine applies to nodes applies here too, and
+    /// for the same reason: a refusal is a verdict on this transaction, while an
+    /// unreachable authority has judged nothing. Collapsing them would turn a
+    /// sponsor's brief outage into a permanent rejection, and — for a caller
+    /// holding signatures over a single-use nonce lane — into re-collecting every
+    /// one of them.
+    ///
+    /// - `2xx` with a signature: approved.
+    /// - `4xx`: refused. Terminal.
+    /// - `5xx`, timeout, connection failure, unreadable body: no verdict. Retryable.
+    async fn request_signature(
+        &self,
+        transaction: Option<&FrameTransaction>,
+        hash: &B256,
+    ) -> Result<Bytes, SignerError> {
+        let body = SignRequest {
+            sig_hash: format!("{hash:#x}"),
+            sponsor: format!("{:#x}", self.address),
+            transaction,
+        };
+
+        let mut request = self.client.post(&self.url).json(&body);
+        if let Some(token) = &self.bearer_token {
+            request = request.bearer_auth(token);
+        }
+
+        // A transport failure is the authority never answering, never its answer.
+        let response = request
+            .send()
+            .await
+            .map_err(|e| SignerError::Unavailable(format!("{} did not answer: {e}", self.url)))?;
+
+        let status = response.status();
+
+        if status.is_client_error() {
+            let detail = response
+                .json::<RefusalBody>()
+                .await
+                .ok()
+                .and_then(|body| body.error.or(body.reason))
+                .unwrap_or_else(|| format!("HTTP {status}"));
+            return Err(SignerError::Refused(detail));
+        }
+
+        // 5xx is the authority failing to reach a decision, not deciding against
+        // the transaction, so it degrades like an unreachable endpoint.
+        if !status.is_success() {
+            return Err(SignerError::Unavailable(format!(
+                "{} answered HTTP {status}",
+                self.url
+            )));
+        }
+
+        let approved: SignResponse = response.json().await.map_err(|e| {
+            SignerError::Unavailable(format!("{} returned an unreadable body: {e}", self.url))
+        })?;
+
+        let raw = approved
+            .signature
+            .strip_prefix("0x")
+            .unwrap_or(&approved.signature);
+        let bytes = alloy::hex::decode(raw).map_err(|e| {
+            SignerError::SignError(format!("{} returned a malformed signature: {e}", self.url))
+        })?;
+
+        // Length is checked here rather than at the node so a broken authority is
+        // named as the cause, instead of surfacing as a rejected transaction.
+        if bytes.len() != 65 {
+            return Err(SignerError::SignError(format!(
+                "{} returned a {}-byte signature, expected 65 (v || r || s)",
+                self.url,
+                bytes.len()
+            )));
+        }
+
+        Ok(Bytes::from(bytes))
+    }
+}
+
+/// Shows the endpoint and address only — never the bearer token.
+impl std::fmt::Debug for RemoteSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteSigner")
+            .field("url", &self.url)
+            .field("address", &self.address)
+            .field("authenticated", &self.bearer_token.is_some())
+            .finish()
+    }
+}
+
+impl Signer for RemoteSigner {
+    /// Signing without the transaction is only ever the boot-time probe: an
+    /// authority that decides cannot decide on a bare digest. It is sent with a
+    /// null transaction so a refusal is the expected, healthy answer.
+    async fn sign_hash(&self, hash: &B256) -> Result<Bytes, SignerError> {
+        self.request_signature(None, hash).await
+    }
+
+    fn address(&self) -> Address {
+        self.address
+    }
+
+    async fn sign_sponsor_frame(
+        &self,
+        tx: &FrameTransaction,
+        hash: &B256,
+    ) -> Result<Bytes, SignerError> {
+        self.request_signature(Some(tx), hash).await
+    }
+}
+
 /// Backend-selectable sponsor signer.
 ///
 /// An enum (rather than `Box<dyn Signer>`) keeps `FrameCompiler<G, S>` generic
@@ -111,6 +338,9 @@ pub enum SponsorSigner {
     /// GCP Cloud KMS asymmetric key (`EC_SIGN_SECP256K1_SHA256`).
     #[cfg(feature = "signer-gcp")]
     GcpKms(AlloyAdapter<alloy::signers::gcp::GcpSigner>),
+    /// An external authority that decides per request (see [`RemoteSigner`]).
+    /// Needs no feature gate: it speaks HTTP, not a vendor SDK.
+    Remote(RemoteSigner),
 }
 
 /// Shows the backend name and address only — no wrapped signer, no key material.
@@ -122,6 +352,7 @@ impl std::fmt::Debug for SponsorSigner {
             SponsorSigner::AwsKms(s) => ("AwsKms", s.address()),
             #[cfg(feature = "signer-gcp")]
             SponsorSigner::GcpKms(s) => ("GcpKms", s.address()),
+            SponsorSigner::Remote(s) => ("Remote", s.address()),
         };
         f.debug_struct("SponsorSigner")
             .field("backend", &backend)
@@ -138,23 +369,83 @@ impl SponsorSigner {
     /// - `aws-kms:<key-id-or-alias>?region=<r>` — AWS KMS (needs `--features signer-aws`).
     /// - `gcp-kms:projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>/cryptoKeyVersions/<v>`
     ///   — GCP Cloud KMS (needs `--features signer-gcp`).
+    /// - `https://host/path?address=0x<20-bytes>[&timeout_ms=<n>]` — an external
+    ///   authority that decides per request (see [`RemoteSigner`]). The whole URI
+    ///   is the endpoint, so the scheme is not stripped.
     ///
     /// `chain_id` is passed to the KMS signer for EIP-155 tagging; frame-tx
     /// signing uses raw digests, but the alloy signers still carry it.
     pub async fn from_uri(uri: &str, chain_id: Option<u64>) -> Result<Self, SignerError> {
         let (scheme, value) = uri.split_once(':').ok_or_else(|| {
             SignerError::InitError(
-                "SPONSOR_SIGNER must be '<scheme>:<value>' (raw:, aws-kms:, gcp-kms:)".to_string(),
+                "SPONSOR_SIGNER must be '<scheme>:<value>' (raw:, aws-kms:, gcp-kms:, https:)"
+                    .to_string(),
             )
         })?;
         match scheme {
             "raw" => Ok(SponsorSigner::InMemory(InMemorySigner::new(value)?)),
             "aws-kms" => Self::from_aws_kms(value, chain_id).await,
             "gcp-kms" => Self::from_gcp_kms(value, chain_id).await,
+            "https" | "http" => Self::from_remote(uri),
             other => Err(SignerError::InitError(format!(
-                "unknown SPONSOR_SIGNER scheme '{other}' (expected raw, aws-kms, or gcp-kms)"
+                "unknown SPONSOR_SIGNER scheme '{other}' (expected raw, aws-kms, gcp-kms, https, or http)"
             ))),
         }
+    }
+
+    /// Builds a [`RemoteSigner`] from the full `https:`/`http:` URI.
+    ///
+    /// `address` is required: the engine has to know which address the authority
+    /// signs as before it can decide the pay frame belongs to this sponsor at
+    /// all, and discovering it from the endpoint would make a compromised or
+    /// misconfigured endpoint able to nominate itself.
+    ///
+    /// The bearer token is read from `SPONSOR_SIGNER_TOKEN` rather than the URI,
+    /// so the credential stays out of anything that logs configuration.
+    fn from_remote(uri: &str) -> Result<Self, SignerError> {
+        let (endpoint, query) = match uri.split_once('?') {
+            Some((endpoint, query)) => (endpoint, Some(query)),
+            None => (uri, None),
+        };
+
+        let address = query
+            .and_then(|q| parse_query_value(q, "address"))
+            .ok_or_else(|| {
+                SignerError::InitError(
+                    "a remote SPONSOR_SIGNER needs ?address=0x<20-bytes>: the address it signs as"
+                        .to_string(),
+                )
+            })?
+            .parse::<Address>()
+            .map_err(|e| {
+                SignerError::InitError(format!("remote SPONSOR_SIGNER address is invalid: {e}"))
+            })?;
+
+        let timeout_secs = match query.and_then(|q| parse_query_value(q, "timeout_ms")) {
+            Some(raw) => {
+                let millis = raw.parse::<u64>().map_err(|e| {
+                    SignerError::InitError(format!(
+                        "remote SPONSOR_SIGNER timeout_ms must be a positive integer: {e}"
+                    ))
+                })?;
+                // Rounded up: a sub-second configured timeout must not become
+                // zero, which reqwest reads as "no timeout at all" — the opposite
+                // of what was asked for, and unbounded in the compile hot path.
+                millis.div_ceil(1000).max(1)
+            }
+            None => REMOTE_SIGNER_DEFAULT_TIMEOUT_SECS,
+        };
+
+        let bearer_token = std::env::var("SPONSOR_SIGNER_TOKEN")
+            .ok()
+            .filter(|token| !token.is_empty());
+
+        Ok(SponsorSigner::Remote(RemoteSigner::new(
+            endpoint.to_string(),
+            address,
+            bearer_token,
+            timeout_secs,
+        )?))
     }
 
     #[cfg(feature = "signer-aws")]
@@ -226,9 +517,9 @@ impl SponsorSigner {
     }
 }
 
-/// Extracts a `key=value` query parameter (e.g. `region=eu-west-1`) from an
-/// `&`-joined query string.
-#[cfg(feature = "signer-aws")]
+/// Extracts a `key=value` query parameter (e.g. `region=eu-west-1`,
+/// `address=0x…`) from an `&`-joined query string. Shared by the AWS KMS and
+/// remote-authority URI parsers.
 fn parse_query_value(query: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}=");
     query
@@ -282,6 +573,22 @@ impl Signer for SponsorSigner {
             SponsorSigner::AwsKms(s) => s.sign_hash(hash).await,
             #[cfg(feature = "signer-gcp")]
             SponsorSigner::GcpKms(s) => s.sign_hash(hash).await,
+            SponsorSigner::Remote(s) => s.sign_hash(hash).await,
+        }
+    }
+
+    async fn sign_sponsor_frame(
+        &self,
+        tx: &FrameTransaction,
+        hash: &B256,
+    ) -> Result<Bytes, SignerError> {
+        match self {
+            SponsorSigner::InMemory(s) => s.sign_sponsor_frame(tx, hash).await,
+            #[cfg(feature = "signer-aws")]
+            SponsorSigner::AwsKms(s) => s.sign_sponsor_frame(tx, hash).await,
+            #[cfg(feature = "signer-gcp")]
+            SponsorSigner::GcpKms(s) => s.sign_sponsor_frame(tx, hash).await,
+            SponsorSigner::Remote(s) => s.sign_sponsor_frame(tx, hash).await,
         }
     }
 
@@ -292,6 +599,7 @@ impl Signer for SponsorSigner {
             SponsorSigner::AwsKms(s) => s.address(),
             #[cfg(feature = "signer-gcp")]
             SponsorSigner::GcpKms(s) => s.address(),
+            SponsorSigner::Remote(s) => s.address(),
         }
     }
 }
