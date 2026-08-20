@@ -134,7 +134,7 @@ impl SponsorPolicy {
 
     /// Evaluates the stateless guards (sender allowlist, per-transaction spend
     /// ceiling). These are pure and reserve nothing, so the compiler runs them
-    /// *before* signing and preflight: a request that fails here never receives a
+    /// *before* signing and simulation: a request that fails here never receives a
     /// sponsor signature and never reaches the node.
     pub fn check_stateless(&self, tx: &FrameTransaction) -> Result<(), PolicyError> {
         let sender = parse_sender(tx)?;
@@ -158,7 +158,7 @@ impl SponsorPolicy {
     /// Atomically reserves this transaction's `max_cost` against the stateful
     /// guards (per-sender windowed quota, global budget). The reservation commits
     /// and has no refund path, so the compiler defers it until *after* a
-    /// successful preflight — a transaction the node would reject must not consume
+    /// successful simulation — a transaction the node would reject must not consume
     /// the irreversible budget or quota. A no-op when no store is configured.
     pub async fn reserve(&self, tx: &FrameTransaction) -> Result<(), PolicyError> {
         let Some(store) = &self.store else {
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn public_posture_fails_closed() {
-        // Nothing configured: public must refuse.
+        // Nothing configured: public must reject.
         assert!(SponsorPolicy::permissive()
             .validate_for(Posture::Public)
             .is_err());

@@ -14,7 +14,7 @@
 //! reservation and never over-permits a limit. Reserve-or-reject executes as a
 //! single atomic Lua script, so concurrent requests cannot race past a limit.
 //!
-//! Reservations happen after a successful preflight, before broadcast. A
+//! Reservations happen after a successful simulation, before broadcast. A
 //! transaction that is later superseded or dropped is not refunded, so the
 //! counters can slightly over-count until the window rolls — conservative for a
 //! spend guard, and self-correcting each window.

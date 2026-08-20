@@ -11,7 +11,7 @@ mod policy_store;
 
 use open_engine_core::{
     domain::FrameTransaction,
-    gateway::{AlloyGateway, ChainGateway},
+    gateway::{AlloyGateway, ChainGateway, FailoverGateway},
     policy::{Posture, PolicyStore, SponsorPolicy},
     signer::{Signer, SponsorSigner},
 };
@@ -147,8 +147,12 @@ fn response(
     )
 }
 
-type AppQueue = Queue<MempoolBroadcaster<AlloyGateway>>;
-type AppCompiler = FrameCompiler<AlloyGateway, SponsorSigner>;
+/// The engine's gateway: one or more endpoints in priority order. A single
+/// configured URL is the degenerate case of the same type, so there is no
+/// separate non-redundant path to keep working.
+type AppGateway = FailoverGateway<AlloyGateway>;
+type AppQueue = Queue<MempoolBroadcaster<AppGateway>>;
+type AppCompiler = FrameCompiler<AppGateway, SponsorSigner>;
 
 #[derive(Clone)]
 struct AppState {
@@ -744,6 +748,93 @@ fn parse_wei(value: String) -> alloy::primitives::U256 {
         .unwrap_or_else(|e| panic!("expected a base-10 u256 wei value, got '{value}': {e}"))
 }
 
+/// Splits a configured endpoint list into individual URLs, in priority order.
+///
+/// Separated from the environment read so the parsing is testable without
+/// mutating process-global state from a parallel test run.
+///
+/// Duplicates are dropped: the same endpoint listed twice is not redundancy,
+/// and it would make one node's outage look like two failures. Returns empty
+/// when nothing usable is named — the caller decides that is fatal.
+fn parse_rpc_urls(configured: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+
+    configured
+        .split(',')
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .filter(|url| seen.insert(url.to_string()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The node endpoints to use, in priority order.
+///
+/// `RPC_URL` accepts a comma-separated list; the first entry is preferred and
+/// the rest are fallbacks used when an endpoint stops answering. A single URL —
+/// the common case — is just a one-element list, so there is no separate
+/// configuration shape for the non-redundant setup.
+fn configured_rpc_urls() -> Vec<String> {
+    let configured =
+        std::env::var("RPC_URL").unwrap_or_else(|_| "http://localhost:8545".to_string());
+
+    let urls = parse_rpc_urls(&configured);
+
+    if urls.is_empty() {
+        panic!("RPC_URL is set but names no endpoints: '{configured}'");
+    }
+
+    urls
+}
+
+#[cfg(test)]
+mod rpc_url_tests {
+    use super::parse_rpc_urls;
+
+    #[test]
+    fn a_single_url_is_a_one_element_list() {
+        assert_eq!(
+            parse_rpc_urls("http://localhost:8545"),
+            vec!["http://localhost:8545"]
+        );
+    }
+
+    #[test]
+    fn priority_order_is_the_order_given() {
+        assert_eq!(
+            parse_rpc_urls("http://primary:8545,http://standby:8545"),
+            vec!["http://primary:8545", "http://standby:8545"]
+        );
+    }
+
+    #[test]
+    fn surrounding_whitespace_and_empty_entries_are_ignored() {
+        assert_eq!(
+            parse_rpc_urls(" http://a:8545 , , http://b:8545 ,"),
+            vec!["http://a:8545", "http://b:8545"]
+        );
+    }
+
+    /// One endpoint listed twice is not two endpoints. Keeping the duplicate
+    /// would report a single node's outage as two failed attempts and make the
+    /// fallback look healthier than it is.
+    #[test]
+    fn duplicates_are_dropped_keeping_the_first_position() {
+        assert_eq!(
+            parse_rpc_urls("http://a:8545,http://b:8545,http://a:8545"),
+            vec!["http://a:8545", "http://b:8545"]
+        );
+    }
+
+    /// The caller treats this as fatal rather than silently booting against a
+    /// default the operator did not ask for.
+    #[test]
+    fn a_list_naming_nothing_is_empty() {
+        assert!(parse_rpc_urls("").is_empty());
+        assert!(parse_rpc_urls("  , ,").is_empty());
+    }
+}
+
 /// Builds the sponsor policy from environment and validates it against the
 /// selected posture.
 ///
@@ -853,11 +944,25 @@ async fn main() {
         .init();
 
     // Configuration (In production, these come from Env/Config)
-    let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| "http://localhost:8545".into());
+    let rpc_urls = configured_rpc_urls();
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".into());
 
+    tracing::info!(
+        endpoints = rpc_urls.len(),
+        urls = %rpc_urls.join(", "),
+        "Node endpoints in priority order"
+    );
+
     // Initialize Components
-    let gateway = Arc::new(AlloyGateway::new(&rpc_url));
+    let gateway = Arc::new(
+        FailoverGateway::new(
+            rpc_urls
+                .iter()
+                .map(|url| AlloyGateway::new(url))
+                .collect::<Vec<_>>(),
+        )
+        .expect("RPC_URL must name at least one endpoint"),
+    );
     let signer = Arc::new(build_sponsor_signer().await);
     let policy = build_sponsor_policy(&redis_url).await;
 

@@ -1,9 +1,13 @@
 use alloy::network::Ethereum;
-use alloy::primitives::{keccak256, Address, Bytes, B256, U256, U64};
+use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy::providers::{Provider, RootProvider};
-use serde::Deserialize;
 use std::future::Future;
 use thiserror::Error;
+
+pub mod ethrex;
+pub mod failover;
+
+pub use failover::FailoverGateway;
 
 #[derive(Debug, Error)]
 pub enum GatewayError {
@@ -19,18 +23,34 @@ pub enum GatewayError {
     #[error("transport failure reaching the node: {0}")]
     Transport(String),
     /// The node does not expose the requested RPC method (JSON-RPC `-32601`),
-    /// e.g. an ethrex node without `--http.api ethrex`, or a non-ethrex node.
+    /// e.g. an ethrex node without `--http.api ethrex`, or a node from a client
+    /// that has no frame-aware simulation at all.
     #[error("RPC method not supported by the node: {0}")]
     UnsupportedMethod(String),
 }
 
 impl GatewayError {
-    /// Whether the failure is worth retrying unchanged.
+    /// Whether re-sending the identical request to the *same* endpoint could
+    /// succeed.
     ///
     /// Only [`Transport`](GatewayError::Transport) is: the other two are the
     /// node's considered answer, and repeating the request repeats the answer.
     pub fn is_transient(&self) -> bool {
         matches!(self, GatewayError::Transport(_))
+    }
+
+    /// Whether the failure says nothing about the transaction itself.
+    ///
+    /// Wider than [`is_transient`](Self::is_transient), and the distinction
+    /// matters: an unsupported method is pointless to retry against the same
+    /// endpoint but is worth asking a *different* one, because it describes the
+    /// endpoint rather than the request. Only [`RpcError`](GatewayError::RpcError)
+    /// is a judgment on these bytes, and a judgment is the same everywhere.
+    pub fn is_non_answer(&self) -> bool {
+        matches!(
+            self,
+            GatewayError::Transport(_) | GatewayError::UnsupportedMethod(_)
+        )
     }
 }
 
@@ -47,7 +67,7 @@ fn classify_rpc_error(
 ) -> GatewayError {
     match error.as_error_resp() {
         // -32601 = method not found: the node has no such method. Kept separate
-        // so callers can degrade to "no preflight" instead of failing.
+        // so callers can degrade to "no simulation" instead of failing.
         Some(resp) if resp.code == -32601 => {
             GatewayError::UnsupportedMethod(resp.message.to_string())
         }
@@ -62,7 +82,8 @@ fn classify_rpc_error(
 /// was lost, so the node now rejects the duplicate. The transaction is live, and
 /// reporting it as failed would be a lie that costs the caller a single-use
 /// nonce lane. Matched case-insensitively against the substrings geth, reth,
-/// erigon, besu and ethrex use.
+/// erigon, besu and ethrex use — this one is deliberately cross-client, since
+/// `eth_sendRawTransaction` is standard RPC rather than any node's dialect.
 fn is_already_known(message: &str) -> bool {
     let message = message.to_lowercase();
     [
@@ -75,50 +96,106 @@ fn is_already_known(message: &str) -> bool {
     .any(|needle| message.contains(needle))
 }
 
-/// Result of `ethrex_simulateFrameTransaction`: ethrex's frame-aware dry-run of
-/// an EIP-8141 frame transaction — the validation-prefix simulation the mempool
-/// applies at admission, plus a full multi-frame execution for gas accounting.
+/// What a node concluded about a frame transaction's validation prefix.
 ///
-/// `valid == false` never under-rejects (the mempool runs this same prefix
-/// simulation), but `valid == true` is necessary, NOT sufficient: standard
-/// admission gates (outer signatures, paymaster funding, fee floors at
-/// broadcast time, ...) are not all re-checked by the simulation.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FrameSimulation {
-    /// Whether the EIP-8141 validation prefix passed.
-    pub valid: bool,
-    /// Recognized validation-prefix shape (`SelfVerify`, `DeploySelfVerify`,
-    /// `OnlyVerifyPay`, `DeployOnlyVerifyPay`), or `None` if the prefix is
-    /// structurally invalid.
-    pub prefix_shape: Option<String>,
-    /// The payer (paymaster or self-funded sender) established by the prefix.
-    pub payer: Option<Address>,
-    /// The transaction's max cost (TXPARAM `0x06`) in wei. Always present —
-    /// it is a pure function of the transaction fields.
-    pub max_cost: U256,
-    /// Reason the transaction is invalid; `None` when `valid` is true.
-    pub violation: Option<String>,
-    /// Accurate total gas used across all frames when the full execution ran.
-    pub gas_used: Option<U64>,
-    /// Per-frame gas and success when the full execution ran.
-    pub frames: Option<Vec<SimulatedFrame>>,
-    /// `"success"` (every frame succeeded) or `"reverted"` (at least one frame
-    /// did not); `None` if the full execution was not run or errored.
-    pub execution_status: Option<String>,
-    /// Error when the full execution could not run or complete (per-tx gas
-    /// cap exceeded, underfunded payer, ...). `None` otherwise.
-    pub execution_error: Option<String>,
+/// Three states, because there are three: the prefix passed, the node examined
+/// it and refused it, or the node declined to examine it at all. The third is
+/// the one that is easy to lose — nodes report it in the same field as a
+/// refusal, and reading it as one rejects transactions the mempool would accept.
+#[derive(Debug, Clone)]
+pub enum PrefixOutcome {
+    /// The node ran the validation prefix and it passed.
+    Passed,
+    /// The node judged the prefix and refused it. Portable: any node judging
+    /// the same bytes reaches the same conclusion, so this is terminal.
+    Violated(String),
+    /// The node produced no verdict — it chose not to run the prefix, e.g.
+    /// because the request exceeded a simulator-side ceiling that admission
+    /// does not apply. Says nothing about the transaction, so it must never be
+    /// reported as a rejection; another endpoint may still judge it, and
+    /// mempool admission at broadcast remains the authority.
+    Declined(String),
 }
 
-/// Per-frame outcome of the full-execution step of a [`FrameSimulation`].
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SimulatedFrame {
-    /// Gas used by this frame.
-    pub gas_used: U64,
-    /// Whether this frame completed successfully (did not revert/halt/skip).
+impl PrefixOutcome {
+    /// Whether the node reached a conclusion about this transaction.
+    ///
+    /// `false` only for [`Declined`](PrefixOutcome::Declined).
+    pub fn is_answer(&self) -> bool {
+        !matches!(self, PrefixOutcome::Declined(_))
+    }
+}
+
+/// Outcome of the full multi-frame execution, when the node ran one.
+#[derive(Debug, Clone)]
+pub enum Execution {
+    /// Every frame succeeded.
+    Succeeded,
+    /// At least one frame did not succeed; carries the failing frame indices.
+    Reverted { failed_frames: Vec<usize> },
+    /// The execution could not run or complete (underfunded payer, a
+    /// node-side limit, ...).
+    Errored(String),
+    /// The node reported an execution status this build does not model. Not a
+    /// verdict: guessing it into success would broadcast something unjudged,
+    /// and guessing it into failure would refuse something possibly fine.
+    Unrecognized(String),
+}
+
+/// Per-frame result of the full-execution step.
+#[derive(Debug, Clone)]
+pub struct FrameOutcome {
+    pub gas_used: u64,
     pub succeeded: bool,
+}
+
+/// A node's frame-aware dry-run of a transaction, in vendor-neutral terms.
+///
+/// Produced by a client dialect (see [`ethrex`]) from that node's wire
+/// response. Nothing above the gateway layer reads a node's field names, status
+/// strings, or violation prose.
+///
+/// A passing prefix is necessary, NOT sufficient: standard admission gates
+/// (outer signatures, paymaster funding, fee floors at broadcast time, ...) are
+/// not all re-checked by a simulation.
+#[derive(Debug, Clone)]
+pub struct Simulation {
+    /// What the node concluded about the validation prefix.
+    pub prefix: PrefixOutcome,
+    /// Recognized validation-prefix shape, when the node names one. Descriptive
+    /// only — carried for logs, never branched on.
+    pub prefix_shape: Option<String>,
+    /// The payer established by the prefix.
+    pub payer: Option<Address>,
+    /// The transaction's max cost (TXPARAM `0x06`) in wei. A pure function of
+    /// the transaction fields, so nodes report it on every path.
+    pub max_cost: U256,
+    /// Total gas used across all frames when the full execution ran.
+    pub gas_used: Option<u64>,
+    /// Per-frame results when the full execution ran; empty otherwise.
+    pub frames: Vec<FrameOutcome>,
+    /// The full execution's outcome, when the node ran one.
+    pub execution: Option<Execution>,
+}
+
+impl Simulation {
+    /// The node's stated reason this transaction would not go through, if it
+    /// gave one.
+    ///
+    /// `None` when the prefix passed *and* execution was fine, and — crucially
+    /// — also `None` when the node declined to look. A decline has no reason to
+    /// report because no judgment was made; surfacing its text here would put a
+    /// non-answer in front of an operator as though it were a rejection.
+    pub fn rejection_reason(&self) -> Option<&str> {
+        if let PrefixOutcome::Violated(reason) = &self.prefix {
+            return Some(reason);
+        }
+
+        match &self.execution {
+            Some(Execution::Errored(reason)) => Some(reason),
+            _ => None,
+        }
+    }
 }
 
 /// Deep seam for all blockchain network interactions.
@@ -143,21 +220,24 @@ pub trait ChainGateway: Send + Sync {
         nonce_key: U256,
     ) -> impl Future<Output = Result<u64, GatewayError>> + Send;
 
-    /// Frame-aware preflight via ethrex's `ethrex_simulateFrameTransaction`:
-    /// dry-runs the EIP-8141 validation prefix (the same admission simulation
-    /// the mempool applies on `eth_sendRawTransaction`) plus a full multi-frame
-    /// execution against latest state, without entering the mempool.
+    /// Frame-aware simulation: dry-runs the EIP-8141 validation prefix (the
+    /// same admission simulation the mempool applies on
+    /// `eth_sendRawTransaction`) plus a full multi-frame execution against
+    /// latest state, without entering the mempool.
     ///
-    /// The transaction is sent in its canonical wire encoding, so it is
-    /// simulated exactly as it would be broadcast. Note the prefix simulation
-    /// validates `nonce_seq` against *current* state — a future-sequence
-    /// transaction reports a nonce violation even though it may become valid
-    /// once its predecessor lands; callers that hold such transactions must
-    /// gate on nonce state before treating a violation as fatal.
+    /// Note the prefix simulation validates `nonce_seq` against *current* state
+    /// — a future-sequence transaction reports a nonce violation even though it
+    /// may become valid once its predecessor lands; callers that hold such
+    /// transactions must gate on nonce state before treating a violation as
+    /// fatal.
+    ///
+    /// Returning `Ok` does not mean the transaction is good: inspect
+    /// [`Simulation::prefix`]. In particular a
+    /// [`Declined`](PrefixOutcome::Declined) prefix is not a rejection.
     fn simulate_frame_transaction(
         &self,
         tx: &crate::domain::FrameTransaction,
-    ) -> impl Future<Output = Result<FrameSimulation, GatewayError>> + Send;
+    ) -> impl Future<Output = Result<Simulation, GatewayError>> + Send;
 
     /// Broadcasts the raw signed transaction bytes to the mempool.
     ///
@@ -171,6 +251,12 @@ pub trait ChainGateway: Send + Sync {
     ) -> impl Future<Output = Result<B256, GatewayError>> + Send;
 }
 
+/// One endpoint, reached over standard Ethereum JSON-RPC.
+///
+/// Nonce reads and broadcast are standard RPC and work against any client. The
+/// frame-aware simulation is not standardized, so it is delegated to a client
+/// dialect — currently [`ethrex`] — which owns that node's method name, wire
+/// schema, and phrasing.
 pub struct AlloyGateway {
     provider: RootProvider<Ethereum>,
 }
@@ -229,33 +315,8 @@ impl ChainGateway for AlloyGateway {
     async fn simulate_frame_transaction(
         &self,
         tx: &crate::domain::FrameTransaction,
-    ) -> Result<FrameSimulation, GatewayError> {
-        // The node takes the canonical wire bytes (the exact encoding
-        // `eth_sendRawTransaction` receives) plus an optional block, omitted
-        // here to simulate against latest.
-        let raw = crate::encoding::Eip8141Encoder::encode_transaction(tx);
-
-        let result: Option<FrameSimulation> = self
-            .provider
-            .client()
-            .request("ethrex_simulateFrameTransaction", (raw,))
-            .await
-            .map_err(|e| match classify_rpc_error(e) {
-                // Report the method by name rather than the node's phrasing, so
-                // the log says which capability is missing.
-                GatewayError::UnsupportedMethod(_) => {
-                    GatewayError::UnsupportedMethod("ethrex_simulateFrameTransaction".to_string())
-                }
-                other => other,
-            })?;
-
-        // The node answers `null` only when the requested block is unknown;
-        // simulation always runs against latest, so surface it as an RPC failure.
-        result.ok_or_else(|| {
-            GatewayError::RpcError(
-                "ethrex_simulateFrameTransaction returned null (block not found)".to_string(),
-            )
-        })
+    ) -> Result<Simulation, GatewayError> {
+        ethrex::simulate(&self.provider, tx).await
     }
 
     async fn send_raw_transaction(&self, bytes: Bytes) -> Result<B256, GatewayError> {
@@ -296,7 +357,7 @@ impl ChainGateway for AlloyGateway {
 /// reports a trivially valid simulation using `gas_limit`, and broadcasts to
 /// `tx_hash`. Shared by the compiler and broadcaster test suites so the two
 /// don't drift.
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 pub struct MockGateway {
     pub nonce: u64,
     pub gas_limit: u64,
@@ -308,9 +369,16 @@ pub struct MockGateway {
     /// When set, the nonce reads fail with this. Separate from `send_error` so a
     /// test can make reconciliation fail while broadcasting would have worked.
     pub nonce_error: Option<fn() -> GatewayError>,
+    /// When set, `simulate_frame_transaction` fails with this — e.g. a node
+    /// that does not expose the method at all.
+    pub simulate_error: Option<fn() -> GatewayError>,
+    /// When true, the simulation *succeeds* but reports that the node refused
+    /// to run the prefix. The response shape a decline actually takes: no error
+    /// anywhere, just no verdict.
+    pub declines_simulation: bool,
 }
 
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 impl Default for MockGateway {
     fn default() -> Self {
         Self {
@@ -319,11 +387,13 @@ impl Default for MockGateway {
             tx_hash: B256::ZERO,
             send_error: None,
             nonce_error: None,
+            simulate_error: None,
+            declines_simulation: false,
         }
     }
 }
 
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 impl ChainGateway for MockGateway {
     async fn get_transaction_count(&self, _address: Address) -> Result<u64, GatewayError> {
         match self.nonce_error {
@@ -346,17 +416,33 @@ impl ChainGateway for MockGateway {
     async fn simulate_frame_transaction(
         &self,
         _tx: &crate::domain::FrameTransaction,
-    ) -> Result<FrameSimulation, GatewayError> {
-        Ok(FrameSimulation {
-            valid: true,
+    ) -> Result<Simulation, GatewayError> {
+        if let Some(make) = self.simulate_error {
+            return Err(make());
+        }
+
+        if self.declines_simulation {
+            return Ok(Simulation {
+                prefix: PrefixOutcome::Declined(
+                    "total gas limit exceeds the per-transaction gas cap; not simulated".to_string(),
+                ),
+                prefix_shape: None,
+                payer: None,
+                max_cost: U256::ZERO,
+                gas_used: None,
+                frames: vec![],
+                execution: None,
+            });
+        }
+
+        Ok(Simulation {
+            prefix: PrefixOutcome::Passed,
             prefix_shape: Some("SelfVerify".to_string()),
             payer: None,
             max_cost: U256::ZERO,
-            violation: None,
-            gas_used: Some(U64::from(self.gas_limit)),
-            frames: None,
-            execution_status: Some("success".to_string()),
-            execution_error: None,
+            gas_used: Some(self.gas_limit),
+            frames: vec![],
+            execution: Some(Execution::Succeeded),
         })
     }
 
@@ -380,13 +466,26 @@ mod tests {
     }
 
     #[test]
-    fn only_transport_failures_are_retryable() {
+    fn only_transport_failures_are_worth_repeating_to_the_same_node() {
         use super::GatewayError;
 
         assert!(GatewayError::Transport("connection refused".into()).is_transient());
         // A rejection is the node's verdict; repeating the request repeats it.
         assert!(!GatewayError::RpcError("nonce too low".into()).is_transient());
         assert!(!GatewayError::UnsupportedMethod("debug_traceCall".into()).is_transient());
+    }
+
+    /// The wider question failover asks: did this tell us anything about the
+    /// transaction? A missing method describes the endpoint, not the request,
+    /// so another endpoint is worth trying even though a retry here is not.
+    #[test]
+    fn only_a_verdict_is_an_answer_about_the_transaction() {
+        use super::GatewayError;
+
+        assert!(GatewayError::Transport("connection refused".into()).is_non_answer());
+        assert!(GatewayError::UnsupportedMethod("ethrex_simulateFrameTransaction".into())
+            .is_non_answer());
+        assert!(!GatewayError::RpcError("nonce too low".into()).is_non_answer());
     }
 
     #[test]
@@ -409,11 +508,11 @@ mod tests {
         assert!(!is_already_known("validation prefix frame reverted"));
     }
 
-    /// Live round-trip of `simulate_frame_transaction`: the engine's canonical encoding
-    /// must be accepted by the node's decoder and the node's response must
-    /// deserialize into [`FrameSimulation`]. Whether the transaction is
-    /// actually valid depends on devnet state (sender code, nonce, balances),
-    /// so only wire compatibility is asserted — not `valid` itself.
+    /// Live round-trip of `simulate_frame_transaction`: the engine's canonical
+    /// encoding must be accepted by the node's decoder and the node's response
+    /// must map into [`super::Simulation`]. Whether the transaction is actually
+    /// valid depends on devnet state (sender code, nonce, balances), so only
+    /// wire compatibility is asserted — not the prefix outcome itself.
     #[tokio::test]
     #[ignore = "Requires a local ethrex node with --http.api ethrex on :8545"]
     async fn simulate_frame_transaction_round_trip() {
@@ -462,8 +561,8 @@ mod tests {
         // every path, so it proves the node decoded these exact bytes as a frame tx.
         assert!(sim.max_cost > U256::ZERO, "max_cost should be non-zero");
         println!(
-            "round-trip ok: valid={} prefix_shape={:?} violation={:?} gas_used={:?}",
-            sim.valid, sim.prefix_shape, sim.violation, sim.gas_used
+            "round-trip ok: prefix={:?} prefix_shape={:?} gas_used={:?}",
+            sim.prefix, sim.prefix_shape, sim.gas_used
         );
     }
 }

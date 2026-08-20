@@ -348,8 +348,12 @@ impl<G: ChainGateway + Send + Sync + 'static> DurableExecution for MempoolBroadc
                 // the job error carries the node's actual rejection reason
                 // instead of an opaque transport error. Ignored on failure —
                 // the node may not expose the simulation RPC at all.
+                //
+                // `rejection_reason` is None when the node declined to judge
+                // the transaction, so a refusal to simulate never becomes a
+                // reason an operator would read as the node's verdict.
                 let diagnosis = match self.gateway.simulate_frame_transaction(tx_data).await {
-                    Ok(sim) => sim.violation.or(sim.execution_error),
+                    Ok(sim) => sim.rejection_reason().map(str::to_string),
                     Err(_) => None,
                 };
                 let detail = diagnosis

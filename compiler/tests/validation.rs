@@ -312,3 +312,56 @@ async fn canonical_expiry_verifier_address() {
     );
 }
 
+/// A node that declines to run the prefix has not judged it, so the compiler
+/// must let the transaction through to broadcast-time admission. Rejecting here
+/// would refuse transactions the mempool accepts — ethrex applies the EIP-7825
+/// cap in its simulator without applying it at admission, which took a working
+/// asset deployment offline the moment a simulation was introduced.
+///
+/// How a given node *words* a decline is its dialect's business and is tested
+/// there (`open_engine_core::gateway::ethrex`); what matters here is that a
+/// decline never becomes a rejection.
+#[tokio::test]
+async fn a_declined_simulation_is_not_a_rejection() {
+    let gateway = Arc::new(MockGateway {
+        declines_simulation: true,
+        ..Default::default()
+    });
+    let sponsor_signer = Arc::new(InMemorySigner::new(SPONSOR_KEY).unwrap());
+    let compiler = FrameCompiler::new(gateway, sponsor_signer);
+
+    let sender = DUMMY_SENDER.to_string();
+    let tx = FrameTransaction {
+        chain_id: 1,
+        nonce_keys: vec![U256::ZERO],
+        nonce_seq: Some(0),
+        sender: sender.clone(),
+        max_priority_fee_per_gas: Some(10),
+        max_fee_per_gas: Some(20),
+        max_fee_per_blob_gas: Some(U256::ZERO),
+        blob_versioned_hashes: vec![],
+        recent_root_references: vec![],
+        frames: vec![Frame {
+            mode: FrameMode::Verify,
+            flags: 0x03,
+            target: Some(sender.clone()),
+            gas_limit: 10_000,
+            value: "0".to_string(),
+            data: "0x".to_string(),
+        }],
+        signatures: vec![FrameSignature {
+            scheme: 0,
+            signer: sender.clone(),
+            msg: "".to_string(),
+            signature: "0x".to_string(),
+        }],
+    };
+
+    let result = compiler.compile_and_validate(tx).await;
+
+    assert!(
+        result.is_ok(),
+        "a declined simulation must not be reported as a rejection, got {:?}",
+        result.err()
+    );
+}

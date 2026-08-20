@@ -20,6 +20,21 @@ pub const MAX_VERIFY_GAS: u64 = 500_000;
 pub const FRAME_TX_MAX_FRAMES: usize = 64;
 pub const EXPIRY_VERIFIER_ADDRESS: &str = "0x0000000000000000000000000000000000008141";
 
+/// EIP-7825 per-transaction gas cap (2^24).
+///
+/// Not enforced by this engine: it is here so a declined simulation can be
+/// explained. A node whose simulator gates on this cap refuses to run a
+/// transaction above it and reports the refusal in the same field as a real
+/// verdict, so the log needs local numbers to say *why* the node walked away.
+///
+/// Deliberately not used to pre-reject or to skip the simulation. Whether the
+/// cap applies at all is fork- and client-dependent — EIP-8037 scopes it to the
+/// execution dimension, leaving state gas bounded only by `tx.gas`, and
+/// EIP-8141 has frames declare `limits.execution` and `limits.state`
+/// separately. Predicting another node's ceiling locally would refuse
+/// transactions that node would happily simulate.
+pub const TX_GAS_LIMIT_CAP: u64 = 1 << 24;
+
 /// EIP-8250: maximum number of nonce keys a single frame transaction may select.
 pub const FRAME_TX_MAX_NONCE_KEYS: usize = 16;
 
@@ -360,7 +375,7 @@ impl FrameTransaction {
     /// of all frame gas limits + recent-root intrinsic gas.
     ///
     /// Kept byte-for-byte aligned with the node so [`Self::max_cost`] and the
-    /// compiler's preflight cross-check agree with what the mempool computes.
+    /// compiler's simulation cross-check agree with what the mempool computes.
     pub fn total_gas_limit(&self) -> u64 {
         use crate::encoding::Eip8141Encoder;
 

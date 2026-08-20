@@ -2,10 +2,10 @@ use alloy::primitives::Address;
 use open_engine_core::domain::{
     Frame, FrameMode, FrameTransaction, EXPIRY_VERIFIER_ADDRESS, FRAME_TX_INTRINSIC_COST,
     FRAME_TX_MAX_FRAMES, FRAME_TX_MAX_NONCE_KEYS, FRAME_TX_MAX_RECENT_ROOT_REFERENCES,
-    FRAME_TX_PER_FRAME_COST, MAX_VERIFY_GAS,
+    FRAME_TX_PER_FRAME_COST, MAX_VERIFY_GAS, TX_GAS_LIMIT_CAP,
 };
 use open_engine_core::encoding::Eip8141Encoder;
-use open_engine_core::gateway::{ChainGateway, GatewayError};
+use open_engine_core::gateway::{ChainGateway, Execution, GatewayError, PrefixOutcome};
 use open_engine_core::policy::SponsorPolicy;
 use open_engine_core::signer::Signer;
 use std::sync::Arc;
@@ -46,7 +46,7 @@ fn classify_gateway_error(error: GatewayError) -> CompilerError {
 
 /// The Compiler acts as the gateway between the API and the Queue.
 /// It enforces EIP-8141 mempool constraints, fills in the `VERIFY` frame
-/// signatures (e.g., Canonical Paymaster), and preflights the signed result
+/// signatures (e.g., Canonical Paymaster), and simulates the signed result
 /// through the node's frame-aware simulation.
 pub struct FrameCompiler<G, S> {
     gateway: Arc<G>,
@@ -84,16 +84,16 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
         // 2. Sponsorship Injection
         // In EIP-8141, the client pre-allocates the VERIFY frame for the paymaster.
         // Find the VERIFY frame belonging to the sponsor and inject the sponsor signature.
-        // This must precede the preflight: the node executes the real VERIFY
+        // This must precede the simulation: the node executes the real VERIFY
         // frames, so a sponsored prefix only passes once the signature is in place.
         // The stateless policy guards run here; the committing spend reservation
         // is deferred to step 4.
         let sponsored = self.inject_sponsor_signature(&mut tx).await?;
 
-        // 3. Frame-aware preflight (ethrex_simulateFrameTransaction)
+        // 3. Frame-aware simulation (ethrex_simulateFrameTransaction)
         self.simulate(&tx).await?;
 
-        // 4. Reserve sponsor spend only once the preflight has passed. The
+        // 4. Reserve sponsor spend only once the simulation has passed. The
         // reservation commits against the per-sender quota and global budget and
         // has no refund path, so a transaction the node would reject must not be
         // allowed to consume it.
@@ -346,7 +346,7 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
         Ok(())
     }
 
-    /// Frame-aware pre-broadcast preflight via `ethrex_simulateFrameTransaction`.
+    /// Frame-aware pre-broadcast simulation via `ethrex_simulateFrameTransaction`.
     ///
     /// The node dry-runs the EIP-8141 validation prefix (the same admission
     /// simulation its mempool applies on `eth_sendRawTransaction`) followed by
@@ -367,9 +367,9 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
     async fn simulate(&self, tx: &FrameTransaction) -> Result<(), CompilerError> {
         // Without a sequence the wire encoding — and thus the simulation — is
         // meaningless. The API rejects this before compiling and the
-        // broadcaster fails it as unpatchable, so just skip the preflight.
+        // broadcaster fails it as unpatchable, so just skip the simulation.
         let Some(seq) = tx.nonce_seq else {
-            info!("nonce_seq not set; skipping preflight simulation");
+            info!("nonce_seq not set; skipping simulation");
             return Ok(());
         };
         let sender: Address = tx
@@ -404,12 +404,13 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
         info!("Simulating frame transaction for sender {}...", tx.sender);
         let sim = match self.gateway.simulate_frame_transaction(tx).await {
             Ok(sim) => sim,
-            // The preflight is best-effort by design; a node without the
-            // `ethrex` namespace falls back to broadcast-time validation
-            // rather than rejecting every transaction.
+            // The simulation is best-effort by design; a node with no
+            // frame-aware simulation RPC falls back to broadcast-time
+            // validation rather than rejecting every transaction. With several
+            // endpoints configured this only arrives once none of them has it.
             Err(GatewayError::UnsupportedMethod(method)) => {
                 warn!(
-                    "node does not expose {method}; skipping frame-aware preflight \
+                    "no configured node exposes {method}; skipping frame-aware simulation \
                      (mempool admission at broadcast remains authoritative)"
                 );
                 return Ok(());
@@ -417,30 +418,69 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
             Err(e) => return Err(classify_gateway_error(e)),
         };
 
-        if !sim.valid {
-            return Err(CompilerError::Simulation(format!(
-                "node rejected the validation prefix: {}",
-                sim.violation.as_deref().unwrap_or("no violation reported")
-            )));
+        match &sim.prefix {
+            PrefixOutcome::Passed => {}
+            // The node ran the prefix and refused it. Terminal: any node
+            // judging these bytes reaches the same conclusion.
+            PrefixOutcome::Violated(violation) => {
+                return Err(CompilerError::Simulation(format!(
+                    "node rejected the validation prefix: {violation}"
+                )));
+            }
+            // No node would run the prefix, so nobody has judged this
+            // transaction, and the absence of a verdict is not a rejection.
+            // Admission at broadcast is the authority and does not always apply
+            // the same bounds a simulator does — failing here would refuse
+            // transactions the mempool accepts. Degrades like a missing RPC.
+            //
+            // The local gas total goes in the log because the usual cause is a
+            // simulator-side ceiling the node will not explain in structured
+            // form; without these numbers the operator cannot tell a refused
+            // transaction from an oversized one.
+            PrefixOutcome::Declined(reason) => {
+                let total_gas_limit = tx.total_gas_limit();
+
+                warn!(
+                    reason = %reason,
+                    total_gas_limit,
+                    over_eip7825_cap = total_gas_limit > TX_GAS_LIMIT_CAP,
+                    "no node would simulate the validation prefix; skipping simulation \
+                     (mempool admission at broadcast remains authoritative)"
+                );
+
+                return Ok(());
+            }
         }
-        if let Some(error) = &sim.execution_error {
-            return Err(CompilerError::Simulation(format!(
-                "full execution failed: {error}"
-            )));
-        }
-        if sim.execution_status.as_deref() == Some("reverted") {
-            let failed: Vec<String> = sim
-                .frames
-                .iter()
-                .flatten()
-                .enumerate()
-                .filter(|(_, frame)| !frame.succeeded)
-                .map(|(index, _)| index.to_string())
-                .collect();
-            return Err(CompilerError::Simulation(format!(
-                "execution reverted at frame(s) [{}]",
-                failed.join(", ")
-            )));
+
+        match &sim.execution {
+            // The node did not run a full execution, so there is nothing to
+            // check here.
+            None => {}
+            Some(Execution::Succeeded) => {}
+            Some(Execution::Errored(error)) => {
+                return Err(CompilerError::Simulation(format!(
+                    "full execution failed: {error}"
+                )));
+            }
+            Some(Execution::Reverted { failed_frames }) => {
+                let indices: Vec<String> =
+                    failed_frames.iter().map(|index| index.to_string()).collect();
+
+                return Err(CompilerError::Simulation(format!(
+                    "execution reverted at frame(s) [{}]",
+                    indices.join(", ")
+                )));
+            }
+            // The node described the outcome in terms this build does not
+            // model. Not a verdict, so it must not reject — but the execution
+            // check did not happen, and silently passing would imply it did.
+            Some(Execution::Unrecognized(status)) => {
+                warn!(
+                    status = %status,
+                    "node reported an execution status this build does not recognize; \
+                     treating the execution check as not performed"
+                );
+            }
         }
 
         // Surface gross over-reservation: unused frame gas is refunded after
@@ -448,18 +488,17 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
         // up front (max_cost), so a wildly padded gas_limit inflates the
         // balance the payer needs. Heuristic: flag frames reserving more than
         // 5x their simulated usage with at least 50k gas of slack.
-        if let Some(frames) = &sim.frames {
-            for (index, (frame, result)) in tx.frames.iter().zip(frames).enumerate() {
-                let used = result.gas_used.to::<u64>();
-                if result.succeeded
-                    && frame.gas_limit > used.saturating_mul(5)
-                    && frame.gas_limit.saturating_sub(used) > 50_000
-                {
-                    warn!(
-                        "frame {index} reserves {} gas but simulation used {used}; the excess inflates the up-front max cost the payer must cover",
-                        frame.gas_limit
-                    );
-                }
+        for (index, (frame, result)) in tx.frames.iter().zip(&sim.frames).enumerate() {
+            let used = result.gas_used;
+
+            if result.succeeded
+                && frame.gas_limit > used.saturating_mul(5)
+                && frame.gas_limit.saturating_sub(used) > 50_000
+            {
+                warn!(
+                    "frame {index} reserves {} gas but simulation used {used}; the excess inflates the up-front max cost the payer must cover",
+                    frame.gas_limit
+                );
             }
         }
 
@@ -496,7 +535,7 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
     ///
     /// Returns `true` when a sponsor signature was injected. The stateless policy
     /// guards (allowlist, spend ceiling) run here, before signing; the committing
-    /// spend reservation is deferred to after a successful preflight (see
+    /// spend reservation is deferred to after a successful simulation (see
     /// [`compile_and_validate`](Self::compile_and_validate)).
     async fn inject_sponsor_signature(
         &self,
@@ -525,7 +564,7 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
 
         // Sponsoring makes this signer the payer. Run the stateless guards
         // (allowlist, ceiling) before signing; the committing spend reservation
-        // is deferred until the preflight has passed (see compile_and_validate).
+        // is deferred until the simulation has passed (see compile_and_validate).
         self.policy
             .check_stateless(tx)
             .map_err(|e| CompilerError::Policy(e.to_string()))?;
