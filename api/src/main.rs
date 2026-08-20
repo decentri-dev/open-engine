@@ -682,7 +682,8 @@ async fn handle_resubmission<G: ChainGateway + Send + Sync + 'static>(
     })
 }
 
-/// Resolves the sponsor signer from configuration.
+/// Resolves the sponsor signer from configuration, or `None` for a relay-only
+/// deployment.
 ///
 /// `SPONSOR_SIGNER` selects the custody backend by URI scheme (`raw:`,
 /// `aws-kms:`, `gcp-kms:` — see [`SponsorSigner::from_uri`]). For backward
@@ -690,7 +691,13 @@ async fn handle_resubmission<G: ChainGateway + Send + Sync + 'static>(
 /// with a deprecation warning. The raw backend loads the private key into
 /// process memory, so it warns loudly and should be replaced by a KMS backend
 /// for any funded sponsor.
-async fn build_sponsor_signer() -> SponsorSigner {
+///
+/// Leaving both unset is a deliberate configuration, not an oversight: the
+/// engine runs relay-only, doing everything except paying. That is a different
+/// posture from a configured-but-idle key — no key to provision, grant, or leak,
+/// and no way for a misconfiguration to spend. Because it is easy to reach by
+/// accident too, boot says which mode it chose.
+async fn build_sponsor_signer() -> Option<SponsorSigner> {
     let uri = match std::env::var("SPONSOR_SIGNER") {
         Ok(uri) => uri,
         Err(_) => match std::env::var("SPONSOR_KEY") {
@@ -700,9 +707,14 @@ async fn build_sponsor_signer() -> SponsorSigner {
                 );
                 format!("raw:{key}")
             }
-            Err(_) => panic!(
-                "SPONSOR_SIGNER must be set (e.g. raw:0x<hex>, aws-kms:<key-id>?region=<r>, or gcp-kms:<resource>)"
-            ),
+            Err(_) => {
+                tracing::warn!(
+                    "No SPONSOR_SIGNER or SPONSOR_KEY set: starting relay-only. Transactions are \
+                     validated, simulated, sequenced and broadcast, but nothing is sponsored and \
+                     no funds are at risk. Requests declaring payer=\"sponsor\" are rejected."
+                );
+                return None;
+            }
         },
     };
 
@@ -738,7 +750,7 @@ async fn build_sponsor_signer() -> SponsorSigner {
         signer = ?signer,
         "Sponsor signer initialized (boot-time test sign OK)"
     );
-    signer
+    Some(signer)
 }
 
 /// Parses a base-10 wei value from an environment string, aborting on error.
@@ -844,12 +856,23 @@ mod rpc_url_tests {
 /// (per-sender quota, global budget) are wired separately when configured.
 /// In `public` mode a policy that does not bound both spend and admission is a
 /// fatal misconfiguration and aborts boot (fail closed).
-async fn build_sponsor_policy(redis_url: &str) -> SponsorPolicy {
-    let posture = std::env::var("OPEN_ENGINE_MODE")
+/// Reads `OPEN_ENGINE_MODE`, defaulting to the trusted-front `gated` posture.
+///
+/// Separated from the policy build because the posture now governs two things:
+/// how hard the sponsor guards are enforced, and whether a caller must declare
+/// its payer intent rather than have it inferred.
+fn configured_posture() -> Posture {
+    std::env::var("OPEN_ENGINE_MODE")
         .ok()
         .map(|value| Posture::parse(&value).unwrap_or_else(|e| panic!("{e}")))
-        .unwrap_or(Posture::Gated);
+        .unwrap_or(Posture::Gated)
+}
 
+async fn build_sponsor_policy(
+    redis_url: &str,
+    posture: Posture,
+    sponsoring: bool,
+) -> SponsorPolicy {
     let max_cost_wei = std::env::var("SPONSOR_MAX_COST_WEI").ok().map(parse_wei);
 
     let sender_allowlist = std::env::var("SPONSOR_SENDER_ALLOWLIST").ok().map(|value| {
@@ -914,18 +937,33 @@ async fn build_sponsor_policy(redis_url: &str) -> SponsorPolicy {
         store,
     };
 
-    if let Err(e) = policy.validate_for(posture) {
+    if let Err(e) = policy.validate_for(posture, sponsoring) {
         panic!("Sponsor policy is unsafe for OPEN_ENGINE_MODE={posture:?}: {e}");
     }
 
-    if posture == Posture::Gated && !policy.has_spend_guard() {
+    if sponsoring && posture == Posture::Gated && !policy.has_spend_guard() {
         tracing::warn!(
             "No sponsor spend ceiling configured (SPONSOR_MAX_COST_WEI unset). A single transaction can charge the sponsor its full max_cost; set a ceiling for defense-in-depth."
         );
     }
 
+    // These guards bound sponsor *spend*, and only for sponsored transactions.
+    // A self-relayed or externally-paid transaction consumes queue slots, RPC
+    // calls and simulation work while touching no guard at all — which has always
+    // been true, since an unsponsored transaction never reached the policy.
+    // `public` means untrusted callers, so name the gap rather than let the
+    // posture imply a bound it does not provide.
+    if posture == Posture::Public {
+        tracing::warn!(
+            "OPEN_ENGINE_MODE=public bounds sponsor spend, not engine resources. Unsponsored \
+             transactions (payer=self/external) consume queue slots, RPC calls and simulation \
+             work with no limit here; front this instance with request rate limiting."
+        );
+    }
+
     tracing::info!(
         posture = ?posture,
+        sponsoring,
         spend_guard = policy.has_spend_guard(),
         admission_guard = policy.has_admission_guard(),
         "Sponsor policy initialized"
@@ -963,14 +1001,25 @@ async fn main() {
         )
         .expect("RPC_URL must name at least one endpoint"),
     );
-    let signer = Arc::new(build_sponsor_signer().await);
-    let policy = build_sponsor_policy(&redis_url).await;
+    let posture = configured_posture();
+    let signer = build_sponsor_signer().await.map(Arc::new);
+    let policy = build_sponsor_policy(&redis_url, posture, signer.is_some()).await;
 
-    let compiler = Arc::new(FrameCompiler::with_policy(
-        gateway.clone(),
-        signer.clone(),
-        policy,
-    ));
+    // Relay-only is the `None` case of the same compiler, not a second pipeline:
+    // validation, simulation, nonce sequencing and broadcast are identical, and
+    // only the ability to sign for payment differs.
+    let compiler = match signer {
+        Some(signer) => FrameCompiler::with_policy(gateway.clone(), signer, policy),
+        None => AppCompiler::relay_only(gateway.clone()),
+    };
+
+    let compiler = Arc::new(compiler);
+
+    tracing::info!(
+        posture = ?posture,
+        sponsoring = compiler.is_sponsoring(),
+        "Compiler initialized"
+    );
 
     let broadcaster = MempoolBroadcaster::new(gateway.clone());
 
@@ -1042,7 +1091,9 @@ mod http_tests {
         format!("test_http_{prefix}_{nanos}")
     }
 
-    async fn cleanup(queue: &TestQueue) {
+    /// Generic over the handler so both the mock-backed queues here and the
+    /// real-gateway queue in `relay_only_over_http` can share it.
+    async fn cleanup<H: queue::DurableExecution>(queue: &Queue<H>) {
         let mut conn = queue.redis.clone();
         let keys: Vec<String> = redis::cmd("KEYS")
             .arg(format!("queue:{}:*", queue.name()))
@@ -1118,6 +1169,7 @@ mod http_tests {
 
     fn frame_tx(nonce_seq: u64) -> FrameTransaction {
         FrameTransaction {
+            payer: None,
             chain_id: 1,
             nonce_keys: vec![alloy::primitives::U256::ZERO],
             nonce_seq: Some(nonce_seq),
@@ -1144,6 +1196,174 @@ mod http_tests {
             .push(JobOptions::new(frame_tx(nonce_seq)).with_id(job_id))
             .await
             .expect("push failed");
+    }
+
+    /// Drives `POST /transaction` through the real handler, the real compiler and
+    /// a real node.
+    ///
+    /// The other tests in this module mount only the status route, because
+    /// [`AppState`] pins the compiler to the concrete [`AppGateway`] and so needs
+    /// a live endpoint. That is the one seam they leave uncovered: whether the
+    /// handler's error mapping sends a payer mismatch back as a client-fixable
+    /// `400` rather than a `500`, and whether an accepted transaction still
+    /// reaches the queue. Both matter most for a relay-only deployment, which has
+    /// no sponsor path to fall back on.
+    ///
+    /// Requires the same devnet as `api/tests/e2e.rs`, and spends a nonce on the
+    /// funded genesis account for the accepted case.
+    mod relay_only_over_http {
+        use super::*;
+        use open_engine_core::domain::PayerIntent;
+        use open_engine_core::encoding::Eip8141Encoder;
+        use open_engine_core::signer::InMemorySigner;
+
+        const DEVNET_RPC: &str = "http://127.0.0.1:8545";
+        const DEVNET_CHAIN_ID: u64 = 3_151_908;
+        /// Funded in the devnet genesis; it is its own payer here, so the node
+        /// charges this account while executing the validation prefix.
+        const FUNDED_KEY: &str =
+            "0x70edad00d375135e138d5e9ca8afd74961af7c9b734e6ebf165cbae9e04466c2";
+        const FUNDED_SENDER: &str = "0x8dAe27091881819fc2951a1a788899487a9c8B17";
+
+        /// The real router, mounted on a relay-only [`AppState`].
+        async fn relay_only_app(queue_name: &str) -> (Router, Arc<AppQueue>) {
+            let gateway = Arc::new(
+                FailoverGateway::new(vec![AlloyGateway::new(DEVNET_RPC)])
+                    .expect("one endpoint is a valid gateway"),
+            );
+            let queue = Arc::new(
+                AppQueue::builder()
+                    .name(queue_name)
+                    .redis_url(REDIS_URL)
+                    .handler(MempoolBroadcaster::new(gateway.clone()))
+                    .build()
+                    .await
+                    .expect("Redis must be running on 127.0.0.1:6379 for this test"),
+            );
+
+            let state = AppState {
+                compiler: Arc::new(AppCompiler::relay_only(gateway)),
+                queue: queue.clone(),
+                tx_received: Arc::new(AtomicU64::new(0)),
+                tx_queued: Arc::new(AtomicU64::new(0)),
+            };
+
+            let app = Router::new()
+                .route("/transaction", post(handle_transaction))
+                .with_state(state);
+            (app, queue)
+        }
+
+        /// A `[self_verify, sender]` transaction signed by the funded account over
+        /// the canonical hash, at its live sequence.
+        async fn signed_self_paid_tx(payer: Option<PayerIntent>) -> FrameTransaction {
+            let gateway = AlloyGateway::new(DEVNET_RPC);
+            let sender: alloy::primitives::Address = FUNDED_SENDER.parse().unwrap();
+            let nonce_seq = gateway
+                .get_keyed_nonce_seq(sender, alloy::primitives::U256::ZERO)
+                .await
+                .expect("devnet must be reachable to read the sender sequence");
+
+            let mut tx = FrameTransaction {
+                payer,
+                chain_id: DEVNET_CHAIN_ID,
+                nonce_keys: vec![alloy::primitives::U256::ZERO],
+                nonce_seq: Some(nonce_seq),
+                sender: FUNDED_SENDER.to_string(),
+                max_priority_fee_per_gas: Some(1_000_000_000),
+                max_fee_per_gas: Some(20_000_000_000),
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: vec![],
+                recent_root_references: vec![],
+                signatures: vec![open_engine_core::domain::FrameSignature {
+                    scheme: 0,
+                    signer: FUNDED_SENDER.to_string(),
+                    msg: String::new(),
+                    signature: String::new(),
+                }],
+                frames: vec![
+                    Frame {
+                        mode: FrameMode::Verify,
+                        flags: 0x03, // APPROVE_EXECUTION_AND_PAYMENT
+                        target: Some(FUNDED_SENDER.to_string()),
+                        gas_limit: 100_000,
+                        value: "0".to_string(),
+                        data: "0x".to_string(),
+                    },
+                    Frame {
+                        mode: FrameMode::Sender,
+                        flags: 0,
+                        target: Some(FUNDED_SENDER.to_string()),
+                        gas_limit: 50_000,
+                        value: "0".to_string(),
+                        data: "0x".to_string(),
+                    },
+                ],
+            };
+
+            // Signature bytes are elided from the canonical hash, so filling the
+            // placeholder afterwards leaves the hash intact.
+            let signer = InMemorySigner::new(FUNDED_KEY).unwrap();
+            let sig_hash = Eip8141Encoder::compute_sig_hash(&tx);
+            let signature = signer.sign_hash(&sig_hash).await.expect("signing failed");
+            tx.signatures[0].signature = alloy::hex::encode(signature);
+            tx
+        }
+
+        async fn post_tx(app: &Router, tx: &FrameTransaction) -> (StatusCode, serde_json::Value) {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/transaction")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(tx).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .expect("request failed");
+
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body = serde_json::from_slice(&bytes).expect("response must be JSON");
+            (status, body)
+        }
+
+        /// A sponsor declaration on a keyless engine is the caller's mistake to
+        /// fix, so it must come back as a 400 naming the deployment.
+        #[tokio::test]
+        #[ignore = "Requires running redis and a local EIP-8141 devnet node on :8545"]
+        async fn rejects_a_sponsor_declaration_with_400() {
+            let (app, queue) = relay_only_app(&unique_queue_name("relay_reject")).await;
+            let tx = signed_self_paid_tx(Some(PayerIntent::Sponsor)).await;
+
+            let (status, body) = post_tx(&app, &tx).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body was {body}");
+            let error = body["error"].as_str().unwrap_or_default();
+            assert!(
+                error.contains("relay-only"),
+                "the message must point at the deployment: {error}"
+            );
+            cleanup(&queue).await;
+        }
+
+        /// The accepted path: nothing about relay-only changes intake, so a
+        /// self-paid transaction must reach the queue exactly as before.
+        #[tokio::test]
+        #[ignore = "Requires running redis and a local EIP-8141 devnet node on :8545"]
+        async fn accepts_a_self_paid_transaction() {
+            let (app, queue) = relay_only_app(&unique_queue_name("relay_accept")).await;
+            let tx = signed_self_paid_tx(Some(PayerIntent::SelfPaid)).await;
+
+            let (status, body) = post_tx(&app, &tx).await;
+            assert!(
+                status.is_success(),
+                "a self-paid transaction must be accepted: {status} {body}"
+            );
+            assert_eq!(body["status"], "queued", "body was {body}");
+            cleanup(&queue).await;
+        }
     }
 
     /// A queue whose node rejects every broadcast, so a job reaches a terminal

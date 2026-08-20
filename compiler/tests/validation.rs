@@ -4,7 +4,7 @@ use common::{MockGateway, DUMMY_SENDER, SPONSOR_KEY};
 use alloy::primitives::{U256};
 use compiler::FrameCompiler;
 use open_engine_core::domain::{
-    Frame, FrameMode, FrameSignature, FrameTransaction, EXPIRY_VERIFIER_ADDRESS,
+    Frame, FrameMode, FrameSignature, FrameTransaction, PayerIntent, EXPIRY_VERIFIER_ADDRESS,
 };
 use open_engine_core::signer::InMemorySigner;
 use std::sync::Arc;
@@ -26,6 +26,7 @@ async fn calldata_cost_enforcement() {
     // 481000 frame gas = 499_275, leaving 725 gas — less than the calldata
     // cost of the RLP-encoded envelope.
     let tx = FrameTransaction {
+        payer: Some(PayerIntent::SelfPaid),
         chain_id: 1,
         nonce_keys: vec![U256::ZERO],
         nonce_seq: Some(0),
@@ -78,6 +79,7 @@ async fn default_budget_admits_heavy_verify_prefix() {
     let sender = DUMMY_SENDER.to_string();
 
     let tx = FrameTransaction {
+        payer: Some(PayerIntent::SelfPaid),
         chain_id: 1,
         nonce_keys: vec![U256::ZERO],
         nonce_seq: Some(0),
@@ -122,6 +124,7 @@ async fn missing_fees_are_rejected() {
     let sender = DUMMY_SENDER.to_string();
 
     let tx = FrameTransaction {
+        payer: Some(PayerIntent::SelfPaid),
         chain_id: 1,
         nonce_keys: vec![U256::ZERO],
         nonce_seq: Some(0),
@@ -164,6 +167,7 @@ async fn malformed_frame_data_is_rejected() {
     let sender = DUMMY_SENDER.to_string();
 
     let tx = FrameTransaction {
+        payer: Some(PayerIntent::SelfPaid),
         chain_id: 1,
         nonce_keys: vec![U256::ZERO],
         nonce_seq: Some(0),
@@ -212,6 +216,7 @@ async fn strict_expiry_verifier_address() {
     let fake_expiry = "0x0000000000000000000000000000000000009141".to_string();
 
     let tx = FrameTransaction {
+        payer: Some(PayerIntent::SelfPaid),
         chain_id: 1,
         nonce_keys: vec![U256::ZERO],
         nonce_seq: Some(0),
@@ -270,6 +275,7 @@ async fn canonical_expiry_verifier_address() {
     let sender = DUMMY_SENDER.to_string();
 
     let tx = FrameTransaction {
+        payer: Some(PayerIntent::SelfPaid),
         chain_id: 1,
         nonce_keys: vec![U256::ZERO],
         nonce_seq: Some(0),
@@ -332,6 +338,7 @@ async fn a_declined_simulation_is_not_a_rejection() {
 
     let sender = DUMMY_SENDER.to_string();
     let tx = FrameTransaction {
+        payer: Some(PayerIntent::SelfPaid),
         chain_id: 1,
         nonce_keys: vec![U256::ZERO],
         nonce_seq: Some(0),

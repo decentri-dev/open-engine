@@ -1,8 +1,8 @@
 use alloy::primitives::Address;
 use open_engine_core::domain::{
-    Frame, FrameMode, FrameTransaction, EXPIRY_VERIFIER_ADDRESS, FRAME_TX_INTRINSIC_COST,
-    FRAME_TX_MAX_FRAMES, FRAME_TX_MAX_NONCE_KEYS, FRAME_TX_MAX_RECENT_ROOT_REFERENCES,
-    FRAME_TX_PER_FRAME_COST, MAX_VERIFY_GAS, TX_GAS_LIMIT_CAP,
+    Frame, FrameMode, FrameTransaction, PayerIntent, EXPIRY_VERIFIER_ADDRESS,
+    FRAME_TX_INTRINSIC_COST, FRAME_TX_MAX_FRAMES, FRAME_TX_MAX_NONCE_KEYS,
+    FRAME_TX_MAX_RECENT_ROOT_REFERENCES, FRAME_TX_PER_FRAME_COST, MAX_VERIFY_GAS, TX_GAS_LIMIT_CAP,
 };
 use open_engine_core::encoding::Eip8141Encoder;
 use open_engine_core::gateway::{ChainGateway, Execution, GatewayError, PrefixOutcome};
@@ -28,6 +28,58 @@ pub enum CompilerError {
     Signing(String),
     #[error("Sponsor policy rejected the transaction: {0}")]
     Policy(String),
+    /// The caller's declared payer intent disagrees with the frame shape, or was
+    /// required and absent. Terminal like [`Validation`](CompilerError::Validation),
+    /// but kept distinct so the mismatch is greppable: it is the one rejection
+    /// that fires on a transaction the node would happily have accepted, just not
+    /// on the terms the caller believed.
+    #[error("Payer intent mismatch: {0}")]
+    PayerIntent(String),
+}
+
+/// The payer the compiler *found* by reading the frame shape, as opposed to the
+/// [`PayerIntent`] the caller *declared*.
+///
+/// Resolution reads only the frames, never the declaration, so the declaration
+/// can be checked against it rather than trusted. Extending the engine to a new
+/// payment arrangement means adding a variant here and a rule in
+/// [`FrameCompiler::resolve_payer`] — the cross-check and the injection gate
+/// follow automatically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedPayer {
+    /// No `pay` frame: the sender approved its own payment.
+    SelfPaid,
+    /// The `pay` frame targets this engine's sponsor signer.
+    Sponsor,
+    /// The `pay` frame targets an address this engine holds no key for. Carries
+    /// the target so the mismatch message can name it.
+    External { target: String },
+}
+
+impl ResolvedPayer {
+    /// The declared intent this resolution corresponds to.
+    fn intent(&self) -> PayerIntent {
+        match self {
+            ResolvedPayer::SelfPaid => PayerIntent::SelfPaid,
+            ResolvedPayer::Sponsor => PayerIntent::Sponsor,
+            ResolvedPayer::External { .. } => PayerIntent::External,
+        }
+    }
+
+    /// How the resolution reads in a rejection message.
+    fn describe(&self) -> String {
+        match self {
+            ResolvedPayer::SelfPaid => {
+                "the prefix has no pay frame, so the sender approves its own payment".to_string()
+            }
+            ResolvedPayer::Sponsor => {
+                "the pay frame targets this engine's sponsor signer".to_string()
+            }
+            ResolvedPayer::External { target } => {
+                format!("the pay frame targets {target}, which this engine holds no key for")
+            }
+        }
+    }
 }
 
 /// Maps a gateway failure onto the compiler's own error split, preserving the
@@ -50,7 +102,12 @@ fn classify_gateway_error(error: GatewayError) -> CompilerError {
 /// through the node's frame-aware simulation.
 pub struct FrameCompiler<G, S> {
     gateway: Arc<G>,
-    sponsor_signer: Arc<S>,
+    /// Absent in relay-only deployments. A missing signer is a stronger posture
+    /// than an unused one: there is no key to provision, grant, or leak, and the
+    /// instance provably cannot spend. Sponsorship then resolves to
+    /// [`ResolvedPayer::External`] for every pay frame, because no address here
+    /// owns one.
+    sponsor_signer: Option<Arc<S>>,
     policy: SponsorPolicy,
 }
 
@@ -66,9 +123,42 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
     pub fn with_policy(gateway: Arc<G>, sponsor_signer: Arc<S>, policy: SponsorPolicy) -> Self {
         Self {
             gateway,
-            sponsor_signer,
+            sponsor_signer: Some(sponsor_signer),
             policy,
         }
+    }
+
+    /// Builds a compiler that holds no sponsor key: it validates, simulates,
+    /// sequences and broadcasts, but never signs for payment and never spends.
+    ///
+    /// Every other guarantee the engine makes is unchanged — the pipeline already
+    /// treats the signed payload as immutable, so sponsorship was the only part
+    /// that depended on holding a key. A `sponsor` declaration is rejected here
+    /// rather than silently downgraded.
+    ///
+    /// `S` is still a type parameter with nothing to infer it from, so callers
+    /// name it: `FrameCompiler::<_, SponsorSigner>::relay_only(gateway)`, or let a
+    /// type alias pin it.
+    pub fn relay_only(gateway: Arc<G>) -> Self {
+        Self {
+            gateway,
+            sponsor_signer: None,
+            policy: SponsorPolicy::permissive(),
+        }
+    }
+
+    /// The sponsor identity, if this compiler holds a key. Lowercased hex
+    /// (`0x…`) so it compares case-insensitively with a frame target.
+    fn sponsor_address(&self) -> Option<String> {
+        self.sponsor_signer
+            .as_ref()
+            .map(|signer| format!("{:#x}", signer.address()))
+    }
+
+    /// Whether this compiler can sponsor at all. Reported at boot so the
+    /// deployment's posture is visible without inspecting the config.
+    pub fn is_sponsoring(&self) -> bool {
+        self.sponsor_signer.is_some()
     }
 
     /// Process an incoming intent, validate it, simulate it, and sign the paymaster frame if present.
@@ -81,22 +171,43 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
         // 1. Structural Validation (EIP-8141 restrictive mempool prefix checking)
         self.validate_structure(&tx)?;
 
-        // 2. Sponsorship Injection
+        // 2. Payer resolution and intent cross-check.
+        // Read who actually pays out of the frame shape, then hold the caller's
+        // declaration against it. A declaration can only reject here — it never
+        // decides where a signature goes.
+        let payer = self.resolve_payer(&tx);
+        self.check_declared_intent(&tx, &payer)?;
+
+        // 3. Sponsorship Injection
         // In EIP-8141, the client pre-allocates the VERIFY frame for the paymaster.
-        // Find the VERIFY frame belonging to the sponsor and inject the sponsor signature.
+        // Inject the sponsor signature into the frame this signer owns.
         // This must precede the simulation: the node executes the real VERIFY
         // frames, so a sponsored prefix only passes once the signature is in place.
         // The stateless policy guards run here; the committing spend reservation
-        // is deferred to step 4.
-        let sponsored = self.inject_sponsor_signature(&mut tx).await?;
+        // is deferred to step 5.
+        let sponsored = match payer {
+            ResolvedPayer::Sponsor => {
+                self.inject_sponsor_signature(&mut tx).await?;
+                true
+            }
+            ResolvedPayer::External { ref target } => {
+                self.warn_on_missing_external_signature(&tx, target);
+                false
+            }
+            ResolvedPayer::SelfPaid => false,
+        };
 
-        // 3. Frame-aware simulation (ethrex_simulateFrameTransaction)
+        // 4. Frame-aware simulation (ethrex_simulateFrameTransaction)
         self.simulate(&tx).await?;
 
-        // 4. Reserve sponsor spend only once the simulation has passed. The
+        // 5. Reserve sponsor spend only once the simulation has passed. The
         // reservation commits against the per-sender quota and global budget and
         // has no refund path, so a transaction the node would reject must not be
         // allowed to consume it.
+        //
+        // Gated on `sponsored` — what the frames say — never on the declaration.
+        // Reserving against a claim would let a mismatched request burn quota it
+        // never spent, with nothing to give it back.
         if sponsored {
             self.policy
                 .reserve(&tx)
@@ -525,41 +636,131 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
         Ok(())
     }
 
-    /// Signs the paymaster VERIFY frame that this signer owns, if present.
+    /// Determines who pays by reading the frame shape — never the declaration.
     ///
-    /// The sponsor frame is identified by its target matching **this compiler's
-    /// signer address** — not merely "any non-sender VERIFY frame". A VERIFY frame
-    /// pointing at some other address is a foreign paymaster arrangement whose
-    /// signature that party supplies; the sponsor signature must never be attached
-    /// to a frame outside this signer's control.
+    /// [`validate_structure`](Self::validate_structure) has already proved the
+    /// prefix is one of the four recognized shapes, so the classification is
+    /// total: either a `pay` frame exists, or the sender approved its own
+    /// payment. A pay frame belongs to this engine only when its target matches
+    /// the signer address this compiler actually holds; on a relay-only instance
+    /// no pay frame can ever match.
+    fn resolve_payer(&self, tx: &FrameTransaction) -> ResolvedPayer {
+        let Some((_, frame)) = tx.pay_frame() else {
+            return ResolvedPayer::SelfPaid;
+        };
+
+        let target = frame.target.as_deref().unwrap_or("").to_lowercase();
+        match self.sponsor_address() {
+            Some(sponsor) if sponsor == target => ResolvedPayer::Sponsor,
+            _ => ResolvedPayer::External { target },
+        }
+    }
+
+    /// Holds the caller's declared [`PayerIntent`] against the resolved payer.
     ///
-    /// Returns `true` when a sponsor signature was injected. The stateless policy
-    /// guards (allowlist, spend ceiling) run here, before signing; the committing
-    /// spend reservation is deferred to after a successful simulation (see
+    /// Without this, the three payment arrangements are indistinguishable to a
+    /// caller that got one wrong: a typo'd paymaster target, a rotated sponsor
+    /// key, or a `[self_verify]` prefix submitted in the belief it was sponsored
+    /// all used to compile identically and silently. The last is the dangerous
+    /// one — it charges the sender's own balance for a transaction the caller
+    /// expected the sponsor to cover.
+    fn check_declared_intent(
+        &self,
+        tx: &FrameTransaction,
+        resolved: &ResolvedPayer,
+    ) -> Result<(), CompilerError> {
+        let Some(declared) = tx.payer else {
+            // Inferring the payer would restore the exact failure this check
+            // exists to remove: the caller learns what the frames meant only from
+            // the consequences. The rejection names the resolution instead, so
+            // the fix is to copy it into the request.
+            return Err(CompilerError::PayerIntent(format!(
+                "payer must be declared (\"self\", \"sponsor\", or \"external\"); this transaction's frames resolve to \"{}\" ({})",
+                resolved.intent().as_str(),
+                resolved.describe()
+            )));
+        };
+
+        if declared == resolved.intent() {
+            info!(
+                payer = declared.as_str(),
+                "Declared payer matches the frame shape"
+            );
+            return Ok(());
+        }
+
+        // A `sponsor` declaration on an instance that holds no key is a
+        // deployment mismatch rather than a malformed transaction, and saying so
+        // saves the caller from auditing frames that are perfectly correct.
+        if declared == PayerIntent::Sponsor && self.sponsor_signer.is_none() {
+            return Err(CompilerError::PayerIntent(
+                "payer \"sponsor\" was declared, but this engine is relay-only and holds no sponsor key; declare \"self\" or \"external\", or point at a sponsoring instance".to_string(),
+            ));
+        }
+
+        Err(CompilerError::PayerIntent(format!(
+            "payer \"{}\" was declared, but the frames resolve to \"{}\": {}",
+            declared.as_str(),
+            resolved.intent().as_str(),
+            resolved.describe()
+        )))
+    }
+
+    /// Warns when an externally-paid transaction carries no signature for its
+    /// paymaster.
+    ///
+    /// Deliberately not a rejection. A paymaster is free to approve on something
+    /// other than a signature — calldata, an allowlist, prior state — and the
+    /// engine cannot read its validation scheme from here. Refusing would decline
+    /// transactions the mempool accepts, which is the failure this codebase
+    /// works hardest to avoid. The far more common case is a caller that forgot
+    /// to collect the third-party signature, so it is worth saying out loud.
+    fn warn_on_missing_external_signature(&self, tx: &FrameTransaction, target: &str) {
+        let has_signature = tx
+            .signatures
+            .iter()
+            .any(|sig| sig.signer.to_lowercase() == target && !sig.signature.is_empty());
+
+        if !has_signature {
+            warn!(
+                paymaster = %target,
+                "externally-paid transaction carries no filled signature for its paymaster; \
+                 this is valid only if that paymaster approves without one"
+            );
+        }
+    }
+
+    /// Signs the paymaster VERIFY frame this signer owns.
+    ///
+    /// Called only once [`resolve_payer`](Self::resolve_payer) has established
+    /// that the pay frame targets **this compiler's signer address**. A VERIFY
+    /// frame pointing at some other address is a foreign paymaster arrangement
+    /// whose signature that party supplies; the sponsor signature must never be
+    /// attached to a frame outside this signer's control. The caller's
+    /// declaration has no say in that — it is checked against this finding, not
+    /// consulted to reach it.
+    ///
+    /// The stateless policy guards (allowlist, spend ceiling) run here, before
+    /// signing; the committing spend reservation is deferred to after a
+    /// successful simulation (see
     /// [`compile_and_validate`](Self::compile_and_validate)).
     async fn inject_sponsor_signature(
         &self,
         tx: &mut FrameTransaction,
-    ) -> Result<bool, CompilerError> {
-        // The sponsor identity: the account whose key this compiler holds.
-        // Lowercased hex (`0x…`) so it compares case-insensitively with a frame target.
-        let sponsor_address = format!("{:#x}", self.sponsor_signer.address());
-
-        let sponsor_frame_index = tx.frames.iter().position(|frame| {
-            let target = frame.target.as_deref().unwrap_or("").to_lowercase();
-            let is_expiry_verifier = target == EXPIRY_VERIFIER_ADDRESS.to_lowercase();
-            matches!(frame.mode, FrameMode::Verify) && !is_expiry_verifier && target == sponsor_address
-        });
-
-        let Some(index) = sponsor_frame_index else {
-            info!(
-                "No sponsor VERIFY frame targets this signer ({sponsor_address}); treating as self-relay or foreign sponsorship."
-            );
-            return Ok(false);
+    ) -> Result<(), CompilerError> {
+        let (Some(signer), Some(sponsor_address)) =
+            (self.sponsor_signer.as_ref(), self.sponsor_address())
+        else {
+            // Unreachable: resolve_payer only returns Sponsor when a signer
+            // exists. Kept as an error rather than an unwrap so a future
+            // resolution rule cannot turn a refactor into a panic.
+            return Err(CompilerError::Signing(
+                "sponsor signature required but this compiler holds no signer".to_string(),
+            ));
         };
 
         info!(
-            "Found sponsor VERIFY frame at index {index} targeting this signer; enforcing policy before signing."
+            "Pay frame targets this signer ({sponsor_address}); enforcing policy before signing."
         );
 
         // Sponsoring makes this signer the payer. Run the stateless guards
@@ -572,8 +773,7 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
         // Compute hash BEFORE mutating signatures (signature bytes are elided
         // from the canonical hash, so filling the placeholder does not change it).
         let sig_hash = Eip8141Encoder::compute_sig_hash(tx);
-        let signature = self
-            .sponsor_signer
+        let signature = signer
             .sign_hash(&sig_hash)
             .await
             .map_err(|e| CompilerError::Signing(e.to_string()))?;
@@ -595,6 +795,6 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
             }
         }
 
-        Ok(true)
+        Ok(())
     }
 }

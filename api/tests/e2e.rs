@@ -1,7 +1,7 @@
 use alloy::primitives::Address;
 use broadcaster::worker::MempoolBroadcaster;
 use compiler::FrameCompiler;
-use open_engine_core::domain::{Frame, FrameMode, FrameSignature, FrameTransaction};
+use open_engine_core::domain::{Frame, FrameMode, FrameSignature, FrameTransaction, PayerIntent};
 use open_engine_core::encoding::Eip8141Encoder;
 use open_engine_core::gateway::{AlloyGateway, ChainGateway};
 use open_engine_core::signer::{InMemorySigner, Signer};
@@ -55,6 +55,7 @@ async fn end_to_end_flow() {
 
     // 5. Create a FrameTransaction Intent (Simulating what the API layer would do)
     let mut frame_tx = FrameTransaction {
+        payer: Some(PayerIntent::SelfPaid),
         chain_id: DEVNET_CHAIN_ID,
         nonce_keys: vec![alloy::primitives::U256::ZERO], // Legacy account-nonce domain
         nonce_seq: Some(nonce_seq), // The sender's current executable sequence

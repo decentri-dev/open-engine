@@ -3,16 +3,21 @@ use common::{MockGateway, DUMMY_SENDER, SPONSOR_KEY};
 
 use alloy::primitives::U256;
 use compiler::{CompilerError, FrameCompiler};
-use open_engine_core::domain::{Frame, FrameMode, FrameSignature, FrameTransaction};
+use open_engine_core::domain::{Frame, FrameMode, FrameSignature, FrameTransaction, PayerIntent};
 use open_engine_core::policy::SponsorPolicy;
 use open_engine_core::signer::{InMemorySigner, Signer};
 use std::sync::Arc;
 
 /// A `[only_verify, pay, sender]` sponsored transaction whose paymaster frame
 /// (and its signature placeholder) target `paymaster`.
-fn sponsored_tx(paymaster: &str) -> FrameTransaction {
+///
+/// `payer` is explicit because the same frames mean different things depending on
+/// who the paymaster is: this signer's own address is `sponsor`, anyone else's is
+/// `external`.
+fn sponsored_tx(paymaster: &str, payer: PayerIntent) -> FrameTransaction {
     let sender = DUMMY_SENDER.to_string();
     FrameTransaction {
+        payer: Some(payer),
         chain_id: 1,
         nonce_keys: vec![U256::ZERO],
         nonce_seq: Some(0),
@@ -66,7 +71,7 @@ async fn signs_only_the_frame_it_owns() {
     // Paymaster frame targets OUR address -> signature injected.
     let ours = format!("{:#x}", signer.address());
     let compiled = compiler
-        .compile_and_validate(sponsored_tx(&ours))
+        .compile_and_validate(sponsored_tx(&ours, PayerIntent::Sponsor))
         .await
         .expect("owned sponsor tx compiles");
     assert!(
@@ -85,7 +90,7 @@ async fn leaves_foreign_paymaster_frame_untouched() {
     // it; the other party supplies that signature.
     let foreign = "0x9999999999999999999999999999999999999999";
     let compiled = compiler
-        .compile_and_validate(sponsored_tx(foreign))
+        .compile_and_validate(sponsored_tx(foreign, PayerIntent::External))
         .await
         .expect("foreign sponsor tx still compiles");
     assert!(
@@ -108,7 +113,7 @@ async fn policy_ceiling_rejects_before_signing() {
     let compiler = FrameCompiler::with_policy(gateway, signer, policy);
 
     let err = compiler
-        .compile_and_validate(sponsored_tx(&ours))
+        .compile_and_validate(sponsored_tx(&ours, PayerIntent::Sponsor))
         .await
         .expect_err("over-ceiling sponsor tx must be rejected");
     assert!(matches!(err, CompilerError::Policy(_)), "got {err:?}");

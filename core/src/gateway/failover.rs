@@ -231,6 +231,7 @@ mod tests {
 
     fn tx() -> FrameTransaction {
         FrameTransaction {
+            payer: None,
             chain_id: 1,
             nonce_keys: vec![U256::ZERO],
             nonce_seq: Some(0),

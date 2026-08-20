@@ -4,7 +4,7 @@ use common::{MockGateway, DUMMY_SENDER, SPONSOR_KEY};
 use alloy::primitives::{B256};
 use broadcaster::{BroadcastOutcome, MempoolBroadcaster};
 use compiler::FrameCompiler;
-use open_engine_core::domain::{Frame, FrameMode, FrameSignature, FrameTransaction};
+use open_engine_core::domain::{Frame, FrameMode, FrameSignature, FrameTransaction, PayerIntent};
 use open_engine_core::signer::{InMemorySigner, Signer};
 use queue::DurableExecution;
 use std::sync::Arc;
@@ -28,6 +28,7 @@ async fn compiles_and_queues_self_relay_tx() {
     // 2. Create a Self-Relay Transaction
     let sender = DUMMY_SENDER.to_string();
     let tx = FrameTransaction {
+        payer: Some(PayerIntent::SelfPaid),
         chain_id: 1,
         nonce_keys: vec![alloy::primitives::U256::ZERO],
         nonce_seq: Some(42), // Explicit sequence, broadcaster won't patch
@@ -114,6 +115,7 @@ async fn compiles_and_queues_sponsored_tx() {
     let paymaster = format!("{:#x}", sponsor_signer.address());
 
     let tx = FrameTransaction {
+        payer: Some(PayerIntent::Sponsor),
         chain_id: 1,
         nonce_keys: vec![alloy::primitives::U256::ZERO],
         nonce_seq: Some(100),

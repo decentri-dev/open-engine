@@ -228,6 +228,47 @@ pub struct FrameSignature {
     pub signature: String,
 }
 
+/// Who approves payment for a frame transaction — the caller's *declared*
+/// intent, cross-checked by the compiler against the frame shape it actually
+/// finds.
+///
+/// This is engine metadata, not an EIP-8141 wire field: it is never encoded and
+/// never covered by the canonical signature hash, so declaring it cannot change
+/// the bytes the node sees. Its only power is to turn a silent mismatch into a
+/// rejection — a caller who believes it is sponsored but submitted a self-relay
+/// prefix would otherwise spend its own balance.
+///
+/// The declaration never routes the sponsor signature. The compiler signs only a
+/// frame whose target is its own signer address; the declaration is checked
+/// against that finding and can only reject, never redirect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PayerIntent {
+    /// The sender approves its own payment: a `[self_verify]` prefix with
+    /// `APPROVE_EXECUTION_AND_PAYMENT` and no separate `pay` frame. The engine
+    /// relays; it neither signs for payment nor spends anything.
+    #[serde(rename = "self")]
+    SelfPaid,
+    /// This engine's sponsor signer approves payment. The `pay` frame targets the
+    /// sponsor address and the engine injects the signature.
+    Sponsor,
+    /// A paymaster this engine holds no key for approves payment. The `pay` frame
+    /// targets a third party whose signature arrives in the payload; the engine
+    /// passes it through untouched.
+    External,
+}
+
+impl PayerIntent {
+    /// The wire spelling, for error messages and logs.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PayerIntent::SelfPaid => "self",
+            PayerIntent::Sponsor => "sponsor",
+            PayerIntent::External => "external",
+        }
+    }
+}
+
 /// An abstract, pre-broadcast representation of an EIP-8141 Frame Transaction.
 ///
 /// This struct is the internal currency of the pipeline — it lives in the Redis
@@ -334,6 +375,19 @@ pub struct FrameTransaction {
     /// List of validated signatures available to the transaction.
     #[serde(default)]
     pub signatures: Vec<FrameSignature>,
+
+    /// Declared payer intent (see [`PayerIntent`]). **Required** — the compiler
+    /// rejects a transaction that omits it.
+    ///
+    /// The `Option` models the wire, not the invariant: a payload without the
+    /// field parses so the *compiler* can refuse it, naming what the frames
+    /// resolve to and what to declare instead. Making serde enforce it would
+    /// trade that for "missing field `payer`", outside the API's JSON error
+    /// envelope and without the one piece of information the caller needs.
+    ///
+    /// Engine metadata only — not encoded, not signed over.
+    #[serde(default)]
+    pub payer: Option<PayerIntent>,
 }
 
 impl FrameTransaction {
@@ -353,6 +407,44 @@ impl FrameTransaction {
     pub fn is_legacy_nonce(&self) -> bool {
         let keys = self.effective_nonce_keys();
         keys.len() == 1 && keys[0].is_zero()
+    }
+
+    /// The frame that approves payment on behalf of a *separate payer*, if there
+    /// is one — i.e. a paymaster's `pay` frame rather than the sender's combined
+    /// `APPROVE_EXECUTION_AND_PAYMENT`.
+    ///
+    /// Scans the validation prefix only, stopping at the first frame that
+    /// approves payment (`flags & 0x01`), which is exactly where the prefix ends.
+    /// The scan cannot run past that point: frames after payer approval are
+    /// unrestricted, so a post-op VERIFY frame carrying `APPROVE_PAYMENT` is
+    /// legal and says nothing about who pays. Expiry-verifier frames are skipped,
+    /// as they are everywhere else the prefix is inspected.
+    ///
+    /// Returns `None` when the approving frame is a self-verify (`0x03`, the
+    /// sender paying for itself), and also when nothing approves payment at all —
+    /// a shape the structural validator rejects before this matters.
+    ///
+    /// The single definition of "who pays": the payer resolver and the
+    /// sponsor-signature injector both read the shape through this, so they
+    /// cannot drift apart.
+    pub fn pay_frame(&self) -> Option<(usize, &Frame)> {
+        for (index, frame) in self.frames.iter().enumerate() {
+            let target = frame.target.as_deref().unwrap_or("").to_lowercase();
+            if target == EXPIRY_VERIFIER_ADDRESS.to_lowercase()
+                && matches!(frame.mode, FrameMode::Verify)
+            {
+                continue;
+            }
+
+            if !matches!(frame.mode, FrameMode::Verify) || frame.flags & 0x01 == 0 {
+                continue;
+            }
+
+            // The prefix concludes here. `0x01` alone is a separate payer;
+            // `0x03` is the sender approving its own payment.
+            return (frame.flags & 0x03 == 0x01).then_some((index, frame));
+        }
+        None
     }
 
     /// EIP-8141 signature-verification gas across all signatures. Unknown
@@ -453,8 +545,132 @@ mod tests {
         assert_eq!(decoded.flags, 2);
     }
 
+    /// Builds a transaction from frames alone; every other field is inert here.
+    fn tx_with_frames(frames: Vec<Frame>) -> FrameTransaction {
+        FrameTransaction {
+            payer: None,
+            chain_id: 1,
+            nonce_keys: vec![U256::ZERO],
+            nonce_seq: Some(0),
+            sender: "0x1111111111111111111111111111111111111111".to_string(),
+            max_priority_fee_per_gas: Some(1),
+            max_fee_per_gas: Some(20),
+            max_fee_per_blob_gas: Some(U256::ZERO),
+            blob_versioned_hashes: vec![],
+            recent_root_references: vec![],
+            signatures: vec![],
+            frames,
+        }
+    }
+
+    fn verify_frame(flags: u8, target: &str) -> Frame {
+        Frame {
+            mode: FrameMode::Verify,
+            flags,
+            target: Some(target.to_string()),
+            gas_limit: 30000,
+            value: "0".to_string(),
+            data: "0x".to_string(),
+        }
+    }
+
+    fn sender_frame() -> Frame {
+        Frame {
+            mode: FrameMode::Sender,
+            flags: 0,
+            target: Some("0x2222222222222222222222222222222222222222".to_string()),
+            gas_limit: 50000,
+            value: "0".to_string(),
+            data: "0x".to_string(),
+        }
+    }
+
+    #[test]
+    fn pay_frame_finds_a_separate_payer() {
+        let paymaster = "0x9999999999999999999999999999999999999999";
+        let tx = tx_with_frames(vec![
+            verify_frame(0x02, "0x1111111111111111111111111111111111111111"),
+            verify_frame(0x01, paymaster),
+            sender_frame(),
+        ]);
+        let (index, frame) = tx.pay_frame().expect("a pay frame is present");
+        assert_eq!(index, 1);
+        assert_eq!(frame.target.as_deref(), Some(paymaster));
+    }
+
+    #[test]
+    fn pay_frame_ignores_a_self_paying_prefix() {
+        let tx = tx_with_frames(vec![
+            verify_frame(0x03, "0x1111111111111111111111111111111111111111"),
+            sender_frame(),
+        ]);
+        assert!(
+            tx.pay_frame().is_none(),
+            "APPROVE_EXECUTION_AND_PAYMENT is the sender paying for itself, not a separate payer"
+        );
+    }
+
+    /// Frames after payer approval are unrestricted, so a post-op VERIFY frame
+    /// may legally carry APPROVE_PAYMENT. Reading it as the payer would report a
+    /// self-relayed transaction as externally paid.
+    #[test]
+    fn pay_frame_does_not_scan_past_the_validation_prefix() {
+        let tx = tx_with_frames(vec![
+            verify_frame(0x03, "0x1111111111111111111111111111111111111111"),
+            sender_frame(),
+            verify_frame(0x01, "0x9999999999999999999999999999999999999999"),
+        ]);
+        assert!(
+            tx.pay_frame().is_none(),
+            "the prefix ended at the self-verify; nothing after it decides who pays"
+        );
+    }
+
+    #[test]
+    fn pay_frame_skips_the_expiry_verifier() {
+        let paymaster = "0x9999999999999999999999999999999999999999";
+        let tx = tx_with_frames(vec![
+            verify_frame(0, EXPIRY_VERIFIER_ADDRESS),
+            verify_frame(0x02, "0x1111111111111111111111111111111111111111"),
+            verify_frame(0x01, paymaster),
+            sender_frame(),
+        ]);
+        let (index, _) = tx.pay_frame().expect("a pay frame is present");
+        assert_eq!(index, 2, "the expiry frame must not shift the answer");
+    }
+
+    #[test]
+    fn payer_intent_uses_the_wire_spellings() {
+        assert_eq!(
+            serde_json::to_string(&PayerIntent::SelfPaid).unwrap(),
+            "\"self\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PayerIntent::Sponsor).unwrap(),
+            "\"sponsor\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PayerIntent::External).unwrap(),
+            "\"external\""
+        );
+    }
+
+    /// The field is engine metadata: a payload that omits it must still parse,
+    /// so every existing client keeps working.
+    #[test]
+    fn payer_is_optional_on_the_wire() {
+        let tx = sample_tx();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&tx).unwrap()).unwrap();
+        json.as_object_mut().unwrap().remove("payer");
+
+        let parsed: FrameTransaction = serde_json::from_value(json).unwrap();
+        assert!(parsed.payer.is_none());
+    }
+
     fn sample_tx() -> FrameTransaction {
         FrameTransaction {
+            payer: None,
             chain_id: 1,
             nonce_keys: vec![U256::ZERO],
             nonce_seq: Some(0),

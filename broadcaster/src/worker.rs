@@ -419,6 +419,7 @@ mod tests {
 
     fn keyed_tx(nonce_keys: Vec<U256>, nonce_seq: Option<u64>) -> FrameTransaction {
         FrameTransaction {
+            payer: None,
             chain_id: 1,
             nonce_keys,
             nonce_seq,

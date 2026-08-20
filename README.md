@@ -2,12 +2,14 @@
 
 A Rust transaction handling engine focused on compiling and broadcasting EIP-8141 Frame Transactions: a high-frequency, reliable transaction broadcaster that manages nonces, gas limits, and paymaster signatures.
 
+Gas sponsorship is one feature, not the price of entry. An instance with no sponsor key still validates, simulates, sequences, retries and broadcasts — see [Sponsor signer](#sponsor-signer-sponsor_signer) and [Declaring who pays](#declaring-who-pays-payer).
+
 ## Architecture & Modules
 
 The `open-engine` workspace is composed of five primary modules operating synchronously through a Redis-backed State Machine:
 
 1. **`api`**: The intake layer built with Axum. It receives strictly structured EIP-8141 Frame Transaction payloads, passes them through the **Compiler**, and queues them. It also initializes and hosts the background worker loop.
-2. **`compiler`**: The validation and enhancement layer. It enforces EIP-8141 frame structure, injects Canonical Paymaster signatures when sponsorship is requested, and simulates the transaction through the chain gateway using the node's frame-aware `ethrex_simulateFrameTransaction` RPC.
+2. **`compiler`**: The validation and enhancement layer. It enforces EIP-8141 frame structure, resolves who pays from the validation prefix (rejecting a request whose declared `payer` disagrees), injects Canonical Paymaster signatures for the frames this engine's signer owns, and simulates the transaction through the chain gateway using the node's frame-aware `ethrex_simulateFrameTransaction` RPC. It runs with or without a sponsor key.
 3. **`queue`**: The Redis-backed State Machine layer. It acts as the concurrency and storage layer used exclusively by the engine to track queue states, retries, idempotency, leases, and crash-recovery logs.
 4. **`broadcaster`**: The component that receives jobs from the queue, reconciles the on-chain nonce, encodes the finalized EIP-8141 Frame Transaction, and submits it to the network.
 5. **`core`** (crate: `open_engine_core`): Shared domain, encoding, signer, and chain gateway primitives used by the API, Compiler, and Broadcaster.
@@ -15,7 +17,7 @@ The `open-engine` workspace is composed of five primary modules operating synchr
 ### Cross-Module Lifecycle
 
 1. **Intake**: Strict Frame Transaction payloads arrive at the `api`.
-2. **Compilation & Enqueue**: The Compiler validates the EIP-8141 frame sequence, injects sponsorship data when needed, simulates the fully signed transaction (`ethrex_simulateFrameTransaction`, skipped for future-sequence transactions the broadcaster will hold), and stores the abstract transaction struct in the `queue`.
+2. **Compilation & Enqueue**: The Compiler validates the EIP-8141 frame sequence, resolves and cross-checks the payer, injects sponsorship data when the pay frame is one this engine owns, simulates the fully signed transaction (`ethrex_simulateFrameTransaction`, skipped for future-sequence transactions the broadcaster will hold), and stores the abstract transaction struct in the `queue`.
 3. **Broadcast & Sequencing**: The `broadcaster` pulls transactions from the `queue`, reconciles the sender nonce, encodes them into bytes, and submits them to the mempool through the chain gateway.
 
 ## Getting started
@@ -34,11 +36,16 @@ The `open-engine` workspace is composed of five primary modules operating synchr
    ```
 
 2. **Run the API**:
-   Starting the API initializes the Compiler, Queue, Broadcaster, and queue worker. It connects to Redis and expects an RPC endpoint plus a sponsor signer:
+   Starting the API initializes the Compiler, Queue, Broadcaster, and queue worker. It connects to Redis and requires an RPC endpoint:
    ```bash
    export RPC_URL=http://localhost:8545
-   export SPONSOR_SIGNER=raw:<hex-encoded-sponsor-key>
    cargo run -p api
+   ```
+
+   That starts relay-only — no funds at risk, nothing to provision. Add a signer
+   to sponsor as well:
+   ```bash
+   export SPONSOR_SIGNER=raw:<hex-encoded-sponsor-key>
    ```
 
    The `MAX_VERIFY_GAS` admission budget is a fixed constant that mirrors the
@@ -67,7 +74,19 @@ The `open-engine` workspace is composed of five primary modules operating synchr
 
 #### Sponsor signer (`SPONSOR_SIGNER`)
 
-The sponsor signer is selected by URI scheme so the private key's custody is a
+Optional. Leave it unset and the engine starts **relay-only**: it validates,
+simulates, sequences, retries and broadcasts exactly as before, but signs for no
+payment and spends nothing. Everything the engine does other than sponsoring is
+already signature-preserving — fees, `nonce_seq` and frames are covered by the
+canonical signature hash, so the pipeline never patched them for anyone — which
+is why removing the key removes only sponsorship.
+
+Relay-only is a stronger posture than a configured-but-idle key: there is no key
+to provision, grant, or leak, and no misconfiguration can spend. Requests
+declaring `"payer": "sponsor"` are rejected there with a message naming the
+deployment, not the frames.
+
+When set, the signer is selected by URI scheme so the private key's custody is a
 deployment decision, not a code change:
 
 | Scheme | Example | Notes |
@@ -108,6 +127,64 @@ only ever signs a paymaster frame whose target is the sponsor signer's own
 address, so a request cannot get the sponsor signature attached to a frame the
 engine does not control.
 
+A **relay-only** instance is exempt from the spend and admission bounds, because
+those guards bound sponsor spend and it has none. Two limits are worth stating
+plainly rather than leaving to inference:
+
+- These guards have never bounded **engine resources**. An unsponsored
+  transaction consumes queue slots, RPC calls and simulation work without
+  touching the policy — true before relay-only existed, since an unsponsored
+  transaction never reached the policy either. Front a `public` instance with
+  request rate limiting; boot warns about this.
+- The engine **cannot fee-bump a stuck transaction**, for any payer. Fees are
+  covered by the canonical signature hash, so a bump means the client re-signs
+  and re-pushes as a replacement (see *Retries and what they protect*).
+
+### Declaring who pays (`payer`)
+
+A frame transaction's payer is decided by its validation prefix: either the
+sender approves its own payment (`[self_verify]`, flags `0x03`), or a separate
+`pay` frame does (`[only_verify, pay]`, flags `0x01`). Three arrangements follow
+from that, and `payer` is the caller's declaration of which one it expects:
+
+| `payer` | Prefix | Payment approved by |
+| --- | --- | --- |
+| `self` | `[self_verify]` / `[deploy, self_verify]` | The sender itself; no `pay` frame |
+| `sponsor` | `[only_verify, pay]` where `pay.target` is the sponsor signer | This engine, signature injected server-side |
+| `external` | `[only_verify, pay]` where `pay.target` is anyone else | A third party, off-engine; its signature is passed through untouched |
+
+The field is engine metadata: it is never encoded and never covered by the
+canonical signature hash, so declaring it cannot change the bytes the node sees.
+It is also never what routes a signature — the compiler signs only a frame whose
+target is its own signer address, and the declaration is checked against that
+finding. A declaration can reject a transaction; it can never redirect one.
+
+`payer` is **required**. A transaction that omits it is rejected with a message
+naming what its frames resolve to, so the fix is to copy that value into the
+request:
+
+```json
+{"error": "Payer intent mismatch: payer must be declared (\"self\", \"sponsor\", or \"external\"); this transaction's frames resolve to \"self\" (the prefix has no pay frame, so the sender approves its own payment)"}
+```
+
+**Why it is required rather than inferred.** Without a declaration the three
+arrangements are indistinguishable to a caller that got one wrong, and all three
+compile identically:
+
+- A typo'd paymaster target, or a rotated sponsor key, produces a valid but
+  unsponsored transaction that fails at the node for insufficient funds.
+- A `[self_verify]` prefix submitted in the belief it was sponsored **succeeds**
+  and charges the sender's own balance.
+
+Declaring `payer` turns each of those into a `400` naming what the frames
+actually resolve to.
+
+The rotated-key case is why this is not merely a `public`-mode guard. It is a
+*deployment* event, not a caller mistake: the caller keeps sending the frames it
+always sent, the signer address moves underneath it, and every transaction
+quietly stops being sponsored. A trusted caller is no better protected from that
+than an anonymous one.
+
 ### Submitting a Frame Transaction via cURL
 
 You can submit an EIP-8141 frame transaction using this `curl` command:
@@ -117,6 +194,7 @@ curl -X POST http://localhost:3001/transaction \
      -H "Content-Type: application/json" \
      -d '{
   "chain_id": 1,
+  "payer": "self",
   "nonce_keys": [0],
   "nonce_seq": 42,
   "sender": "0x1111111111111111111111111111111111111111",

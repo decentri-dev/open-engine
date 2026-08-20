@@ -110,10 +110,24 @@ impl SponsorPolicy {
         self.sender_allowlist.is_some() || self.store.is_some()
     }
 
-    /// Validates that this policy is safe to run under `posture`. `public` fails
-    /// closed: it must bound both spend and admission so it cannot become an
-    /// open sponsor faucet. `gated` always passes (guards are optional there).
-    pub fn validate_for(&self, posture: Posture) -> Result<(), String> {
+    /// Validates that this policy is safe to run under `posture`, given whether
+    /// the deployment holds a sponsor key at all.
+    ///
+    /// `public` fails closed: it must bound both spend and admission so it cannot
+    /// become an open sponsor faucet. `gated` always passes (guards are optional
+    /// there).
+    ///
+    /// A relay-only deployment (`sponsoring == false`) is exempt, because these
+    /// guards bound *sponsor spend* and there is none — demanding a spend ceiling
+    /// from an instance that holds no key would be a ritual, not a protection.
+    /// Note what this does and does not cover: it says nothing about engine
+    /// resources (queue slots, RPC quota, simulation work), which no guard here
+    /// has ever bounded. See the boot warning the API emits for `public`.
+    pub fn validate_for(&self, posture: Posture, sponsoring: bool) -> Result<(), String> {
+        if !sponsoring {
+            return Ok(());
+        }
+
         match posture {
             Posture::Gated => Ok(()),
             Posture::Public => {
@@ -185,6 +199,7 @@ mod tests {
 
     fn tx_with_fee(max_fee: u128) -> FrameTransaction {
         FrameTransaction {
+            payer: None,
             chain_id: 1,
             nonce_keys: vec![U256::ZERO],
             nonce_seq: Some(0),
@@ -270,14 +285,14 @@ mod tests {
     fn public_posture_fails_closed() {
         // Nothing configured: public must reject.
         assert!(SponsorPolicy::permissive()
-            .validate_for(Posture::Public)
+            .validate_for(Posture::Public, true)
             .is_err());
         // Ceiling only: still missing an admission bound.
         assert!(SponsorPolicy {
             max_cost_wei: Some(U256::from(1u64)),
             ..Default::default()
         }
-        .validate_for(Posture::Public)
+        .validate_for(Posture::Public, true)
         .is_err());
         // Ceiling + allowlist: satisfies both bounds.
         assert!(SponsorPolicy {
@@ -285,12 +300,29 @@ mod tests {
             sender_allowlist: Some(HashSet::new()),
             ..Default::default()
         }
-        .validate_for(Posture::Public)
+        .validate_for(Posture::Public, true)
         .is_ok());
         // gated accepts an empty policy.
         assert!(SponsorPolicy::permissive()
-            .validate_for(Posture::Gated)
+            .validate_for(Posture::Gated, true)
             .is_ok());
+    }
+
+    /// A relay-only deployment holds no key, so there is no sponsor spend for
+    /// these guards to bound. Requiring a ceiling from it would be a ritual: the
+    /// same config that `public` rejects for a sponsoring instance is safe here.
+    #[test]
+    fn relay_only_is_exempt_from_the_public_fail_closed_check() {
+        let unguarded = SponsorPolicy::permissive();
+
+        assert!(
+            unguarded.validate_for(Posture::Public, true).is_err(),
+            "a sponsoring public instance must still fail closed"
+        );
+        assert!(
+            unguarded.validate_for(Posture::Public, false).is_ok(),
+            "a relay-only public instance has no sponsor spend to bound"
+        );
     }
 
     #[test]

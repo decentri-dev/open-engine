@@ -528,6 +528,7 @@ mod tests {
 
         let sender = "0x1111111111111111111111111111111111111111".to_string();
         let tx = FrameTransaction {
+            payer: None,
             chain_id,
             nonce_keys: vec![U256::ZERO],
             nonce_seq: Some(0),
