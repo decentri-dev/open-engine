@@ -686,36 +686,23 @@ async fn handle_resubmission<G: ChainGateway + Send + Sync + 'static>(
 /// deployment.
 ///
 /// `SPONSOR_SIGNER` selects the custody backend by URI scheme (`raw:`,
-/// `aws-kms:`, `gcp-kms:` — see [`SponsorSigner::from_uri`]). For backward
-/// compatibility a bare `SPONSOR_KEY` is still accepted and mapped to `raw:`,
-/// with a deprecation warning. The raw backend loads the private key into
-/// process memory, so it warns loudly and should be replaced by a KMS backend
-/// for any funded sponsor.
+/// `aws-kms:`, `gcp-kms:` — see [`SponsorSigner::from_uri`]). The raw backend
+/// loads the private key into process memory, so it warns loudly and should be
+/// replaced by a KMS backend for any funded sponsor.
 ///
-/// Leaving both unset is a deliberate configuration, not an oversight: the
-/// engine runs relay-only, doing everything except paying. That is a different
-/// posture from a configured-but-idle key — no key to provision, grant, or leak,
-/// and no way for a misconfiguration to spend. Because it is easy to reach by
-/// accident too, boot says which mode it chose.
+/// Leaving it unset is a deliberate configuration, not an oversight: the engine
+/// runs relay-only, doing everything except paying. That is a different posture
+/// from a configured-but-idle key — no key to provision, grant, or leak, and no
+/// way for a misconfiguration to spend. Because it is easy to reach by accident
+/// too, boot says which mode it chose.
 async fn build_sponsor_signer() -> Option<SponsorSigner> {
-    let uri = match std::env::var("SPONSOR_SIGNER") {
-        Ok(uri) => uri,
-        Err(_) => match std::env::var("SPONSOR_KEY") {
-            Ok(key) => {
-                tracing::warn!(
-                    "SPONSOR_KEY is deprecated; set SPONSOR_SIGNER=raw:<hex> (or aws-kms:/gcp-kms:) instead"
-                );
-                format!("raw:{key}")
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "No SPONSOR_SIGNER or SPONSOR_KEY set: starting relay-only. Transactions are \
-                     validated, simulated, sequenced and broadcast, but nothing is sponsored and \
-                     no funds are at risk. Requests declaring payer=\"sponsor\" are rejected."
-                );
-                return None;
-            }
-        },
+    let Ok(uri) = std::env::var("SPONSOR_SIGNER") else {
+        tracing::warn!(
+            "No SPONSOR_SIGNER set: starting relay-only. Transactions are validated, simulated, \
+             sequenced and broadcast, but nothing is sponsored and no funds are at risk. Requests \
+             declaring payer=\"sponsor\" are rejected."
+        );
+        return None;
     };
 
     if uri.starts_with("raw:") {

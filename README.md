@@ -99,8 +99,6 @@ KMS backends are off by default, so a plain build pulls in no cloud SDK:
 ```bash
 cargo run -p api --features signer-aws          # or signer-gcp, or both
 ```
-`SPONSOR_KEY` (bare hex) is still accepted for backward compatibility and is
-treated as `raw:`, with a deprecation warning.
 
 #### Deployment posture and sponsor policy
 
