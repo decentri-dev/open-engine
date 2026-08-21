@@ -1,4 +1,5 @@
 use crate::domain::FrameTransaction;
+use crate::http;
 use alloy::primitives::{Address, Bytes, B256};
 use alloy::signers::{local::PrivateKeySigner, Signer as AlloySigner};
 use std::future::Future;
@@ -174,16 +175,6 @@ struct SignResponse {
     signature: String,
 }
 
-/// An authority's explanation when it declines. Optional — a bare 4xx is a
-/// complete refusal on its own.
-#[derive(serde::Deserialize)]
-struct RefusalBody {
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    reason: Option<String>,
-}
-
 impl RemoteSigner {
     /// Builds an authority-backed signer.
     ///
@@ -197,10 +188,7 @@ impl RemoteSigner {
         bearer_token: Option<String>,
         timeout_secs: u64,
     ) -> Result<Self, SignerError> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| SignerError::InitError(format!("could not build HTTP client: {e}")))?;
+        let client = http::build_client(timeout_secs).map_err(SignerError::InitError)?;
 
         Ok(Self {
             url,
@@ -247,13 +235,7 @@ impl RemoteSigner {
         let status = response.status();
 
         if status.is_client_error() {
-            let detail = response
-                .json::<RefusalBody>()
-                .await
-                .ok()
-                .and_then(|body| body.error.or(body.reason))
-                .unwrap_or_else(|| format!("HTTP {status}"));
-            return Err(SignerError::Refused(detail));
+            return Err(SignerError::Refused(http::refusal_detail(response).await));
         }
 
         // 5xx is the authority failing to reach a decision, not deciding against
@@ -403,13 +385,10 @@ impl SponsorSigner {
     /// The bearer token is read from `SPONSOR_SIGNER_TOKEN` rather than the URI,
     /// so the credential stays out of anything that logs configuration.
     fn from_remote(uri: &str) -> Result<Self, SignerError> {
-        let (endpoint, query) = match uri.split_once('?') {
-            Some((endpoint, query)) => (endpoint, Some(query)),
-            None => (uri, None),
-        };
+        let (endpoint, query) = http::split_endpoint(uri);
 
         let address = query
-            .and_then(|q| parse_query_value(q, "address"))
+            .and_then(|q| http::parse_query_value(q, "address"))
             .ok_or_else(|| {
                 SignerError::InitError(
                     "a remote SPONSOR_SIGNER needs ?address=0x<20-bytes>: the address it signs as"
@@ -421,20 +400,8 @@ impl SponsorSigner {
                 SignerError::InitError(format!("remote SPONSOR_SIGNER address is invalid: {e}"))
             })?;
 
-        let timeout_secs = match query.and_then(|q| parse_query_value(q, "timeout_ms")) {
-            Some(raw) => {
-                let millis = raw.parse::<u64>().map_err(|e| {
-                    SignerError::InitError(format!(
-                        "remote SPONSOR_SIGNER timeout_ms must be a positive integer: {e}"
-                    ))
-                })?;
-                // Rounded up: a sub-second configured timeout must not become
-                // zero, which reqwest reads as "no timeout at all" — the opposite
-                // of what was asked for, and unbounded in the compile hot path.
-                millis.div_ceil(1000).max(1)
-            }
-            None => REMOTE_SIGNER_DEFAULT_TIMEOUT_SECS,
-        };
+        let timeout_secs = http::timeout_secs_from_query(query, REMOTE_SIGNER_DEFAULT_TIMEOUT_SECS)
+            .map_err(|e| SignerError::InitError(format!("remote SPONSOR_SIGNER {e}")))?;
 
         let bearer_token = std::env::var("SPONSOR_SIGNER_TOKEN")
             .ok()
@@ -453,7 +420,7 @@ impl SponsorSigner {
         use alloy::signers::aws::{aws_config, aws_sdk_kms, AwsSigner};
 
         let (key_id, region) = match value.split_once('?') {
-            Some((key, query)) => (key, parse_query_value(query, "region")),
+            Some((key, query)) => (key, http::parse_query_value(query, "region")),
             None => (value, None),
         };
         if key_id.is_empty() {
@@ -515,18 +482,6 @@ impl SponsorSigner {
                 .to_string(),
         ))
     }
-}
-
-/// Extracts a `key=value` query parameter (e.g. `region=eu-west-1`,
-/// `address=0x…`) from an `&`-joined query string. Shared by the AWS KMS and
-/// remote-authority URI parsers.
-fn parse_query_value(query: &str, key: &str) -> Option<String> {
-    let prefix = format!("{key}=");
-    query
-        .split('&')
-        .find_map(|kv| kv.strip_prefix(&prefix))
-        .filter(|v| !v.is_empty())
-        .map(|v| v.to_string())
 }
 
 /// The pieces of a GCP KMS crypto-key-version resource path.

@@ -165,6 +165,68 @@ authenticating without asking for a real signature. An unreachable endpoint warn
 but does not stop startup: relay and self-paid traffic need no sponsor, and
 sponsored requests answer `503` until it returns.
 
+#### Sponsor policy webhook (`SPONSOR_POLICY_WEBHOOK`)
+
+The same idea as the `https:` signer, with the key on the other side. Here the
+engine keeps its own key (`raw:`, `aws-kms:`, `gcp-kms:`) and only asks
+permission before using it:
+
+```bash
+export SPONSOR_SIGNER=aws-kms:alias/sponsor?region=eu-west-1
+export SPONSOR_POLICY_WEBHOOK='https://policy.example.com/decide?timeout_ms=2000'
+export SPONSOR_POLICY_WEBHOOK_TOKEN=…
+```
+
+**Request** — `POST`, with the cost figure already computed so your endpoint does
+not have to reimplement the network's gas accounting:
+
+```json
+{
+  "sponsor": "0xabc…",
+  "sender": "0x111…",
+  "maxCost": "42000000000000",
+  "transaction": { … }
+}
+```
+
+**Answer** — the status code is the decision:
+
+| Your answer | Engine's reading | Caller sees |
+| --- | --- | --- |
+| `2xx` (any body, or none) | approved | transaction is queued |
+| `2xx` + `{"approved": false}` | refused | `400`, with your reason |
+| `4xx` | refused | `400`, with your `reason` or `error` |
+| `5xx`, timeout, connection refused | no verdict was reached | `503`, retry unchanged |
+| `2xx` + an unreadable body | no verdict was reached | `503`, retry unchanged |
+
+`200 {"approved": false}` is honoured as a refusal even though the status says
+otherwise. Reading it as approval would spend money you meant to withhold, so the
+safer interpretation wins.
+
+It runs after the local guards (an over-ceiling request never costs a
+round-trip), before signing, and before simulation — nothing is spent on a
+transaction you have already refused. It is consulted **only** when this engine's
+own key would pay: `payer: self` and `payer: external` transactions never reach
+it.
+
+##### Choosing between the webhook and an `https:` signer
+
+Both give you arbitrary logic over your own data, over the same JSON, with the
+same latency. The difference is only who holds the key:
+
+| | Key lives with | A "no" is enforced by |
+| --- | --- | --- |
+| `SPONSOR_POLICY_WEBHOOK` | this engine | the engine asking, and honouring the answer |
+| `SPONSOR_SIGNER=https:` | you | the absence of a signature |
+
+Pick the webhook when you would rather not run signing infrastructure and are
+content to trust the operator. Pick the `https:` signer when your refusal has to
+hold even if this engine is buggy, compromised, or unfriendly — with no key here,
+it cannot spend your money whatever it does.
+
+They compose: a webhook in front of a KMS key gives custom policy over a key you
+still control the custody of.
+
 #### Deployment posture and sponsor policy
 
 `OPEN_ENGINE_MODE` selects how much the sponsor policy is trusted to do:
@@ -176,9 +238,11 @@ sponsored requests answer `503` until it returns.
   both spend and admission.
 
 These guards are a fixed vocabulary evaluated against state the engine can see.
-They are not a substitute for a [sponsor authority](#sponsor-authority-https-signer)
-and an authority does not replace them: the authority expresses your product
-logic, the guards bound the damage regardless of what it approves.
+They are not a substitute for a
+[sponsor authority](#sponsor-authority-https-signer) or a
+[policy webhook](#sponsor-policy-webhook-sponsor_policy_webhook), and neither
+replaces them: those express your product logic, while the guards bound the
+damage regardless of what gets approved.
 
 Policy guards (all optional in `gated`, required as noted in `public`):
 

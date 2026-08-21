@@ -34,6 +34,14 @@ pub enum PolicyError {
     GlobalBudgetExhausted,
     #[error("policy store error: {0}")]
     Store(String),
+    /// A policy webhook judged the transaction and declined to sponsor it.
+    /// A verdict, so it is terminal: asking again gets the same answer.
+    #[error("{0}")]
+    Refused(String),
+    /// A policy webhook could not be reached, or answered in a way that reached
+    /// no decision. Nothing was judged, so the caller should retry unchanged.
+    #[error("sponsor policy webhook unreachable: {0}")]
+    Unavailable(String),
 }
 
 /// A boxed, `Send` future — the object-safe return type for [`PolicyStore`].
@@ -51,6 +59,150 @@ pub trait PolicyStore: Send + Sync {
     /// `sender`, reserving `max_cost` against both. Returns an error if either
     /// limit would be exceeded (nothing is reserved in that case).
     fn try_reserve(&self, sender: Address, max_cost: U256) -> BoxFuture<'_, Result<(), PolicyError>>;
+}
+
+/// Default seconds to wait for a webhook's decision.
+const POLICY_WEBHOOK_DEFAULT_TIMEOUT_SECS: u64 = 5;
+
+/// An endpoint that decides whether this engine's sponsor should pay, per
+/// transaction.
+///
+/// The guards in [`SponsorPolicy`] are a fixed vocabulary evaluated against
+/// state the engine can see. This is an arbitrary function evaluated against
+/// state it cannot: a subscription, a risk score, a rule that only exists in the
+/// operator's own system. It answers with a decision only — the engine still
+/// holds the key and signs.
+///
+/// That is the difference from a
+/// [`RemoteSigner`](crate::signer::RemoteSigner), and it is worth being precise
+/// about because the two look alike on the wire. There, the key lives with the
+/// party deciding, so a refusal is enforced by the absence of a signature and
+/// the engine *cannot* overrule it. Here the engine could sign without asking;
+/// it does not, but nothing outside this code stops it. A webhook is the right
+/// shape when the deciding party will not hold a key, and the wrong one when
+/// they need their refusal to be more than a promise.
+pub struct PolicyAuthority {
+    url: String,
+    bearer_token: Option<String>,
+    client: reqwest::Client,
+}
+
+/// What the engine asks.
+///
+/// `max_cost` is included even though it is derivable from the transaction: it
+/// is the number a spending decision actually turns on, and recomputing it means
+/// reimplementing the network's gas accounting exactly. Sending it keeps the
+/// endpoint simple and keeps both sides agreeing on the figure.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DecisionRequest<'a> {
+    sponsor: String,
+    sender: &'a str,
+    max_cost: String,
+    transaction: &'a FrameTransaction,
+}
+
+impl PolicyAuthority {
+    /// Builds a webhook client from a configured URI.
+    ///
+    /// `sponsor` is the address this engine would sign as, sent so the endpoint
+    /// knows which of its sponsors is being asked without parsing frames.
+    pub fn from_uri(uri: &str, bearer_token: Option<String>) -> Result<Self, String> {
+        let (endpoint, query) = crate::http::split_endpoint(uri);
+        let timeout_secs =
+            crate::http::timeout_secs_from_query(query, POLICY_WEBHOOK_DEFAULT_TIMEOUT_SECS)?;
+
+        Ok(Self {
+            url: endpoint.to_string(),
+            bearer_token,
+            client: crate::http::build_client(timeout_secs)?,
+        })
+    }
+
+    /// Asks the webhook whether to sponsor `tx`.
+    ///
+    /// The reject/decline split matches the sponsor authority's exactly, and for
+    /// the same reason: a refusal is a verdict on these bytes and is terminal,
+    /// while an endpoint that never answered has judged nothing and must stay
+    /// retryable, or a webhook's brief outage costs a caller every signature it
+    /// collected for a single-use nonce lane.
+    async fn decide(&self, sponsor: Address, tx: &FrameTransaction) -> Result<(), PolicyError> {
+        let body = DecisionRequest {
+            sponsor: format!("{sponsor:#x}"),
+            sender: &tx.sender,
+            max_cost: tx.max_cost().to_string(),
+            transaction: tx,
+        };
+
+        let mut request = self.client.post(&self.url).json(&body);
+        if let Some(token) = &self.bearer_token {
+            request = request.bearer_auth(token);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| PolicyError::Unavailable(format!("{} did not answer: {e}", self.url)))?;
+
+        let status = response.status();
+
+        if status.is_client_error() {
+            return Err(PolicyError::Refused(
+                crate::http::refusal_detail(response).await,
+            ));
+        }
+
+        // A 5xx is the endpoint failing to reach a decision, not deciding
+        // against the transaction.
+        if !status.is_success() {
+            return Err(PolicyError::Unavailable(format!(
+                "{} answered HTTP {status}",
+                self.url
+            )));
+        }
+
+        // A success with nothing to say is approval; there is nothing else a 2xx
+        // could mean.
+        let payload = response.text().await.map_err(|e| {
+            PolicyError::Unavailable(format!("{} returned an unreadable body: {e}", self.url))
+        })?;
+        if payload.trim().is_empty() {
+            return Ok(());
+        }
+
+        // A body that cannot be read is not approval. Spending on a garbled
+        // answer is the one outcome worth refusing to guess at, and it is the
+        // endpoint that is broken, so this degrades like an outage rather than
+        // blaming the transaction.
+        let explanation: crate::http::Explanation =
+            serde_json::from_str(&payload).map_err(|e| {
+                PolicyError::Unavailable(format!(
+                    "{} returned a body that is neither empty nor a decision: {e}",
+                    self.url
+                ))
+            })?;
+
+        // `200 {"approved": false}` is a natural way to say no, and reading it as
+        // yes would spend money the endpoint meant to withhold.
+        if explanation.is_explicit_refusal() {
+            let detail = explanation
+                .detail()
+                .unwrap_or_else(|| "sponsorship declined".to_string());
+            return Err(PolicyError::Refused(detail));
+        }
+
+        Ok(())
+    }
+}
+
+/// Shows the endpoint only — never the bearer token.
+impl std::fmt::Debug for PolicyAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PolicyAuthority")
+            .field("url", &self.url)
+            .field("authenticated", &self.bearer_token.is_some())
+            .finish()
+    }
 }
 
 /// Deployment posture. Selects the *defaults* and *boot validation* over the
@@ -90,6 +242,9 @@ pub struct SponsorPolicy {
     pub sender_allowlist: Option<HashSet<Address>>,
     /// Stateful per-sender quota + global budget backend (see [`PolicyStore`]).
     pub store: Option<Arc<dyn PolicyStore>>,
+    /// Optional per-request decision endpoint (see [`PolicyAuthority`]). Absent
+    /// means the guards above are the whole policy.
+    pub authority: Option<Arc<PolicyAuthority>>,
 }
 
 impl SponsorPolicy {
@@ -167,6 +322,29 @@ impl SponsorPolicy {
         }
 
         Ok(())
+    }
+
+    /// Asks the configured [`PolicyAuthority`], if any, whether to sponsor `tx`.
+    ///
+    /// A no-op when no webhook is configured, so a deployment that wants only the
+    /// local guards pays nothing for this.
+    ///
+    /// Runs before signing and before simulation: there is no point signing a
+    /// transaction that will be discarded, and no point spending a node's
+    /// simulation on one the sponsor has already refused. It is deliberately not
+    /// folded into [`check_stateless`](Self::check_stateless) — those guards are
+    /// local, pure and free, and collapsing a network round-trip into them would
+    /// hide its cost and its failure modes.
+    pub async fn decide(&self, sponsor: Address, tx: &FrameTransaction) -> Result<(), PolicyError> {
+        let Some(authority) = &self.authority else {
+            return Ok(());
+        };
+        authority.decide(sponsor, tx).await
+    }
+
+    /// Whether a per-request decision endpoint is configured.
+    pub fn has_authority(&self) -> bool {
+        self.authority.is_some()
     }
 
     /// Atomically reserves this transaction's `max_cost` against the stateful

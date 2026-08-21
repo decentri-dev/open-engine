@@ -12,7 +12,7 @@ mod policy_store;
 use open_engine_core::{
     domain::FrameTransaction,
     gateway::{AlloyGateway, ChainGateway, FailoverGateway},
-    policy::{Posture, PolicyStore, SponsorPolicy},
+    policy::{PolicyAuthority, PolicyStore, Posture, SponsorPolicy},
     signer::{Signer, SignerError, SponsorSigner},
 };
 use policy_store::RedisPolicyStore;
@@ -945,10 +945,36 @@ async fn build_sponsor_policy(
         None
     };
 
+    // A per-request decision endpoint. Optional, and orthogonal to the guards
+    // above: the webhook expresses policy the engine's config vocabulary cannot,
+    // while the guards bound the damage regardless of what it approves.
+    let authority = std::env::var("SPONSOR_POLICY_WEBHOOK")
+        .ok()
+        .filter(|uri| !uri.is_empty())
+        .map(|uri| {
+            let token = std::env::var("SPONSOR_POLICY_WEBHOOK_TOKEN")
+                .ok()
+                .filter(|token| !token.is_empty());
+            let authority = PolicyAuthority::from_uri(&uri, token)
+                .unwrap_or_else(|e| panic!("SPONSOR_POLICY_WEBHOOK is unusable: {e}"));
+            tracing::info!(authority = ?authority, "Sponsor policy webhook configured");
+            Arc::new(authority)
+        });
+
+    // A webhook on an engine that sponsors nothing can never be consulted, and
+    // reads as protection that is not there.
+    if authority.is_some() && !sponsoring {
+        tracing::warn!(
+            "SPONSOR_POLICY_WEBHOOK is set but this engine is relay-only, so it holds no key to \
+             gate and the webhook will never be called."
+        );
+    }
+
     let policy = SponsorPolicy {
         max_cost_wei,
         sender_allowlist,
         store,
+        authority,
     };
 
     if let Err(e) = policy.validate_for(posture, sponsoring) {
@@ -980,6 +1006,7 @@ async fn build_sponsor_policy(
         sponsoring,
         spend_guard = policy.has_spend_guard(),
         admission_guard = policy.has_admission_guard(),
+        webhook = policy.has_authority(),
         "Sponsor policy initialized"
     );
     policy

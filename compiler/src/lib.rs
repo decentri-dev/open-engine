@@ -6,7 +6,7 @@ use open_engine_core::domain::{
 };
 use open_engine_core::encoding::Eip8141Encoder;
 use open_engine_core::gateway::{ChainGateway, Execution, GatewayError, PrefixOutcome};
-use open_engine_core::policy::SponsorPolicy;
+use open_engine_core::policy::{PolicyError, SponsorPolicy};
 use open_engine_core::signer::{Signer, SignerError};
 use std::sync::Arc;
 use thiserror::Error;
@@ -110,6 +110,26 @@ fn classify_signer_error(error: SignerError) -> CompilerError {
         SignerError::Refused(detail) => CompilerError::Policy(detail),
         SignerError::Unavailable(detail) => CompilerError::Unavailable(detail),
         other => CompilerError::Signing(other.to_string()),
+    }
+}
+
+/// Maps a policy failure onto the compiler's error split.
+///
+/// A webhook that refuses has judged this transaction, so it is terminal and
+/// reaches the caller as the rejection it is, carrying the endpoint's own words.
+/// A webhook that could not be reached has judged nothing.
+///
+/// `Store` joins the unreachable side for the same reason: a Redis failure means
+/// the reservation never happened, not that the transaction was over budget.
+/// Reporting it as a rejection would tell a caller to rebuild a transaction that
+/// nothing ever refused.
+fn classify_policy_error(error: PolicyError) -> CompilerError {
+    match error {
+        PolicyError::Refused(detail) => CompilerError::Policy(detail),
+        PolicyError::Unavailable(detail) | PolicyError::Store(detail) => {
+            CompilerError::Unavailable(detail)
+        }
+        other => CompilerError::Policy(other.to_string()),
     }
 }
 
@@ -229,7 +249,7 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
             self.policy
                 .reserve(&tx)
                 .await
-                .map_err(|e| CompilerError::Policy(e.to_string()))?;
+                .map_err(classify_policy_error)?;
         }
 
         Ok(tx)
@@ -783,9 +803,16 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
         // Sponsoring makes this signer the payer. Run the stateless guards
         // (allowlist, ceiling) before signing; the committing spend reservation
         // is deferred until the simulation has passed (see compile_and_validate).
+        self.policy.check_stateless(tx).map_err(classify_policy_error)?;
+
+        // Then the per-request decision, if one is configured. After the free
+        // local guards, so an obviously-over-ceiling request never costs a
+        // round-trip; before signing and simulation, so nothing is spent on a
+        // transaction the sponsor has already refused.
         self.policy
-            .check_stateless(tx)
-            .map_err(|e| CompilerError::Policy(e.to_string()))?;
+            .decide(signer.address(), tx)
+            .await
+            .map_err(classify_policy_error)?;
 
         // Compute hash BEFORE mutating signatures (signature bytes are elided
         // from the canonical hash, so filling the placeholder does not change it).
