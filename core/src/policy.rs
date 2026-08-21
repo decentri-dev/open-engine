@@ -83,7 +83,7 @@ const POLICY_WEBHOOK_DEFAULT_TIMEOUT_SECS: u64 = 5;
 /// they need their refusal to be more than a promise.
 pub struct PolicyAuthority {
     url: String,
-    bearer_token: Option<String>,
+    credentials: crate::http::Credentials,
     client: reqwest::Client,
 }
 
@@ -107,15 +107,26 @@ impl PolicyAuthority {
     ///
     /// `sponsor` is the address this engine would sign as, sent so the endpoint
     /// knows which of its sponsors is being asked without parsing frames.
-    pub fn from_uri(uri: &str, bearer_token: Option<String>) -> Result<Self, String> {
+    pub fn from_uri(uri: &str, credentials: crate::http::Credentials) -> Result<Self, String> {
         let (endpoint, query) = crate::http::split_endpoint(uri);
         let timeout_secs =
             crate::http::timeout_secs_from_query(query, POLICY_WEBHOOK_DEFAULT_TIMEOUT_SECS)?;
+        let client = crate::http::build_client(timeout_secs)?;
+
+        crate::http::warn_if_plaintext(endpoint, "The sponsor policy webhook");
+        if !credentials.is_signed() {
+            tracing::warn!(
+                url = %endpoint,
+                "Sponsor policy webhook requests are not HMAC-signed. Set \
+                 SPONSOR_POLICY_WEBHOOK_HMAC_SECRET so the endpoint can verify requests came from \
+                 this engine and are not replays."
+            );
+        }
 
         Ok(Self {
             url: endpoint.to_string(),
-            bearer_token,
-            client: crate::http::build_client(timeout_secs)?,
+            credentials,
+            client,
         })
     }
 
@@ -134,15 +145,9 @@ impl PolicyAuthority {
             transaction: tx,
         };
 
-        let mut request = self.client.post(&self.url).json(&body);
-        if let Some(token) = &self.bearer_token {
-            request = request.bearer_auth(token);
-        }
-
-        let response = request
-            .send()
+        let response = crate::http::post_signed(&self.client, &self.url, &body, &self.credentials)
             .await
-            .map_err(|e| PolicyError::Unavailable(format!("{} did not answer: {e}", self.url)))?;
+            .map_err(PolicyError::Unavailable)?;
 
         let status = response.status();
 
@@ -200,7 +205,7 @@ impl std::fmt::Debug for PolicyAuthority {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PolicyAuthority")
             .field("url", &self.url)
-            .field("authenticated", &self.bearer_token.is_some())
+            .field("credentials", &self.credentials)
             .finish()
     }
 }

@@ -151,7 +151,7 @@ const REMOTE_SIGNER_DEFAULT_TIMEOUT_SECS: u64 = 5;
 pub struct RemoteSigner {
     url: String,
     address: Address,
-    bearer_token: Option<String>,
+    credentials: http::Credentials,
     client: reqwest::Client,
 }
 
@@ -185,15 +185,28 @@ impl RemoteSigner {
     pub fn new(
         url: String,
         address: Address,
-        bearer_token: Option<String>,
+        credentials: http::Credentials,
         timeout_secs: u64,
     ) -> Result<Self, SignerError> {
         let client = http::build_client(timeout_secs).map_err(SignerError::InitError)?;
+        http::warn_if_plaintext(&url, "The sponsor authority");
+
+        // This endpoint hands back a usable sponsor signature, so anyone able to
+        // forge a request to it gets their transaction paid for. A bearer token
+        // travels on every request and is therefore only as private as the least
+        // careful proxy or log between here and there.
+        if !credentials.is_signed() {
+            tracing::warn!(
+                url = %url,
+                "Sponsor authority requests are not HMAC-signed. Set SPONSOR_SIGNER_HMAC_SECRET \
+                 so the endpoint can verify requests came from this engine and are not replays."
+            );
+        }
 
         Ok(Self {
             url,
             address,
-            bearer_token,
+            credentials,
             client,
         })
     }
@@ -221,16 +234,10 @@ impl RemoteSigner {
             transaction,
         };
 
-        let mut request = self.client.post(&self.url).json(&body);
-        if let Some(token) = &self.bearer_token {
-            request = request.bearer_auth(token);
-        }
-
         // A transport failure is the authority never answering, never its answer.
-        let response = request
-            .send()
+        let response = http::post_signed(&self.client, &self.url, &body, &self.credentials)
             .await
-            .map_err(|e| SignerError::Unavailable(format!("{} did not answer: {e}", self.url)))?;
+            .map_err(SignerError::Unavailable)?;
 
         let status = response.status();
 
@@ -279,7 +286,7 @@ impl std::fmt::Debug for RemoteSigner {
         f.debug_struct("RemoteSigner")
             .field("url", &self.url)
             .field("address", &self.address)
-            .field("authenticated", &self.bearer_token.is_some())
+            .field("credentials", &self.credentials)
             .finish()
     }
 }
@@ -382,8 +389,9 @@ impl SponsorSigner {
     /// all, and discovering it from the endpoint would make a compromised or
     /// misconfigured endpoint able to nominate itself.
     ///
-    /// The bearer token is read from `SPONSOR_SIGNER_TOKEN` rather than the URI,
-    /// so the credential stays out of anything that logs configuration.
+    /// Credentials come from `SPONSOR_SIGNER_TOKEN` and
+    /// `SPONSOR_SIGNER_HMAC_SECRET` rather than the URI, so neither ends up in
+    /// anything that logs configuration.
     fn from_remote(uri: &str) -> Result<Self, SignerError> {
         let (endpoint, query) = http::split_endpoint(uri);
 
@@ -403,14 +411,13 @@ impl SponsorSigner {
         let timeout_secs = http::timeout_secs_from_query(query, REMOTE_SIGNER_DEFAULT_TIMEOUT_SECS)
             .map_err(|e| SignerError::InitError(format!("remote SPONSOR_SIGNER {e}")))?;
 
-        let bearer_token = std::env::var("SPONSOR_SIGNER_TOKEN")
-            .ok()
-            .filter(|token| !token.is_empty());
+        let credentials =
+            http::Credentials::from_env("SPONSOR_SIGNER_TOKEN", "SPONSOR_SIGNER_HMAC_SECRET");
 
         Ok(SponsorSigner::Remote(RemoteSigner::new(
             endpoint.to_string(),
             address,
-            bearer_token,
+            credentials,
             timeout_secs,
         )?))
     }

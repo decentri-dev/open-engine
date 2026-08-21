@@ -8,6 +8,7 @@
 
 use alloy::primitives::{Address, U256};
 use open_engine_core::domain::{Frame, FrameMode, FrameSignature, FrameTransaction, PayerIntent};
+use open_engine_core::http::Credentials;
 use open_engine_core::policy::{PolicyAuthority, PolicyError, SponsorPolicy};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -59,7 +60,7 @@ fn sponsor() -> Address {
 
 fn policy_calling(url: &str) -> SponsorPolicy {
     SponsorPolicy {
-        authority: Some(Arc::new(PolicyAuthority::from_uri(url, None).unwrap())),
+        authority: Some(Arc::new(PolicyAuthority::from_uri(url, Credentials::none()).unwrap())),
         ..Default::default()
     }
 }
@@ -228,7 +229,7 @@ async fn the_request_carries_the_sponsor_sender_and_cost() {
 
 #[tokio::test]
 async fn a_malformed_timeout_is_rejected_at_construction() {
-    let err = PolicyAuthority::from_uri("https://example.com/decide?timeout_ms=soon", None)
+    let err = PolicyAuthority::from_uri("https://example.com/decide?timeout_ms=soon", Credentials::none())
         .expect_err("a malformed timeout must not reach the compile path");
     assert!(err.contains("timeout_ms"), "got {err}");
 }

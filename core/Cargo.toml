@@ -8,6 +8,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 reqwest = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
 tracing = { workspace = true }
 alloy = { version = "2.0.4", features = ["serde", "signers", "rlp", "signer-local", "providers", "transport-http"] }
 
@@ -24,3 +26,5 @@ signer-gcp = ["alloy/signer-gcp"]
 [dev-dependencies]
 tokio = { workspace = true }
 serde_json = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }

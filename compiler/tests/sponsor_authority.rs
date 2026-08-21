@@ -12,6 +12,7 @@ use common::{MockGateway, DUMMY_SENDER};
 use alloy::primitives::{Address, Bytes, B256, U256};
 use compiler::{CompilerError, FrameCompiler};
 use open_engine_core::domain::{Frame, FrameMode, FrameSignature, FrameTransaction, PayerIntent};
+use open_engine_core::http::Credentials;
 use open_engine_core::policy::{PolicyAuthority, SponsorPolicy};
 use open_engine_core::signer::{Signer, SignerError};
 use std::sync::{Arc, Mutex};
@@ -215,7 +216,7 @@ async fn spawn_webhook(
 fn policy_calling(url: &str, max_cost_wei: Option<U256>) -> SponsorPolicy {
     SponsorPolicy {
         max_cost_wei,
-        authority: Some(Arc::new(PolicyAuthority::from_uri(url, None).unwrap())),
+        authority: Some(Arc::new(PolicyAuthority::from_uri(url, Credentials::none()).unwrap())),
         ..Default::default()
     }
 }

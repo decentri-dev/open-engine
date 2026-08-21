@@ -7,6 +7,7 @@
 
 use alloy::primitives::{Address, B256, U256};
 use open_engine_core::domain::{Frame, FrameMode, FrameSignature, FrameTransaction, PayerIntent};
+use open_engine_core::http::Credentials;
 use open_engine_core::signer::{RemoteSigner, Signer, SignerError, SponsorSigner};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -66,7 +67,7 @@ fn sponsor_address() -> Address {
 }
 
 fn signer_for(url: &str) -> RemoteSigner {
-    RemoteSigner::new(url.to_string(), sponsor_address(), None, 2).unwrap()
+    RemoteSigner::new(url.to_string(), sponsor_address(), Credentials::none(), 2).unwrap()
 }
 
 fn sponsored_tx() -> FrameTransaction {

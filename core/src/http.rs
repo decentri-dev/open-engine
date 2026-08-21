@@ -12,7 +12,182 @@
 //! draw that line separately is how they would come to disagree, and the cost of
 //! getting it wrong is a caller throwing away signatures over a brief outage.
 
-use serde::Deserialize;
+use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Header carrying the unix second the request was signed at.
+pub const TIMESTAMP_HEADER: &str = "X-Open-Engine-Timestamp";
+/// Header carrying `sha256=<hex>` over `"{timestamp}.{body}"`.
+pub const SIGNATURE_HEADER: &str = "X-Open-Engine-Signature";
+
+/// How the engine proves to an outbound endpoint that a request came from it.
+///
+/// Two mechanisms, independently optional, and worth keeping separate because
+/// they fail differently. A bearer token is the credential *itself* travelling on
+/// every request: anything that records a request — a proxy, an access log, an
+/// APM trace, a TLS-terminating load balancer — records something that can forge
+/// every future request. An HMAC signature is derived, so capturing one lets an
+/// attacker replay that message and forge nothing else.
+///
+/// Signing therefore belongs on any endpoint that returns something worth
+/// stealing. The sponsor authority returns a *usable sponsor signature*, so
+/// whoever can forge a request to it gets their transaction paid for out of the
+/// sponsor's funds; a bearer token alone is thin protection for that.
+#[derive(Clone, Default)]
+pub struct Credentials {
+    bearer_token: Option<String>,
+    hmac_secret: Option<String>,
+}
+
+impl Credentials {
+    /// No authentication. For local endpoints and tests.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Builds credentials explicitly. Empty strings are treated as absent, so an
+    /// unset-but-present environment variable does not become a secret of `""`.
+    pub fn new(bearer_token: Option<String>, hmac_secret: Option<String>) -> Self {
+        fn clean(value: Option<String>) -> Option<String> {
+            value.filter(|v| !v.is_empty())
+        }
+        Self {
+            bearer_token: clean(bearer_token),
+            hmac_secret: clean(hmac_secret),
+        }
+    }
+
+    /// Reads both credentials from the environment.
+    pub fn from_env(token_var: &str, secret_var: &str) -> Self {
+        Self::new(
+            std::env::var(token_var).ok(),
+            std::env::var(secret_var).ok(),
+        )
+    }
+
+    /// Whether requests carry an HMAC signature.
+    pub fn is_signed(&self) -> bool {
+        self.hmac_secret.is_some()
+    }
+
+    /// Whether anything at all identifies the caller.
+    pub fn is_authenticated(&self) -> bool {
+        self.bearer_token.is_some() || self.hmac_secret.is_some()
+    }
+}
+
+/// Shows only which mechanisms are present — never the secrets.
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("bearer", &self.bearer_token.is_some())
+            .field("hmac", &self.hmac_secret.is_some())
+            .finish()
+    }
+}
+
+/// Computes `HMAC-SHA256(secret, "{timestamp}.{body}")` as lowercase hex.
+///
+/// The timestamp is inside the digest, not merely alongside it. Sending it as a
+/// bare header would let an attacker replay an old request with a fresh
+/// timestamp and an unchanged, still-valid signature, which is the whole failure
+/// the timestamp exists to prevent.
+fn sign(secret: &str, timestamp: u64, body: &[u8]) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .expect("HMAC-SHA256 accepts a key of any length");
+    mac.update(timestamp.to_string().as_bytes());
+    mac.update(b".");
+    mac.update(body);
+    alloy::hex::encode(mac.finalize().into_bytes())
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// POSTs `body` as JSON, authenticated with `credentials`.
+///
+/// The payload is serialized once and both signed and sent, so the signature
+/// covers exactly the bytes on the wire. Re-serializing to sign would leave the
+/// receiver verifying a digest of something subtly different — different key
+/// order, different float formatting — and failing for reasons neither side
+/// could see.
+///
+/// An error here means the request never reached the endpoint, so callers should
+/// treat it as the absence of an answer rather than a negative one.
+pub(crate) async fn post_signed<T: Serialize>(
+    client: &reqwest::Client,
+    url: &str,
+    body: &T,
+    credentials: &Credentials,
+) -> Result<reqwest::Response, String> {
+    let payload =
+        serde_json::to_vec(body).map_err(|e| format!("could not encode the request body: {e}"))?;
+
+    let mut request = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
+
+    if let Some(token) = &credentials.bearer_token {
+        request = request.bearer_auth(token);
+    }
+
+    if let Some(secret) = &credentials.hmac_secret {
+        let timestamp = unix_now();
+        request = request
+            .header(TIMESTAMP_HEADER, timestamp.to_string())
+            .header(
+                SIGNATURE_HEADER,
+                format!("sha256={}", sign(secret, timestamp, &payload)),
+            );
+    }
+
+    request
+        .body(payload)
+        .send()
+        .await
+        .map_err(|e| format!("{url} did not answer: {e}"))
+}
+
+/// Warns when an endpoint is configured over plaintext HTTP.
+///
+/// Loopback is exempt: a local endpoint is how these are tested, and nothing
+/// leaves the machine. Anywhere else, a bearer token is sent in the clear on
+/// every request, and an HMAC signature — while not itself secret — is
+/// verifying a body any observer can read and modify.
+///
+/// A warning rather than a refusal: this is operator-set configuration, not
+/// caller input, and an operator with a reason to run plaintext inside a trusted
+/// network should not be blocked by this code.
+pub(crate) fn warn_if_plaintext(url: &str, what: &str) {
+    let Some(authority) = url.strip_prefix("http://") else {
+        return;
+    };
+    let host = authority
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit_once(':')
+        .map(|(host, _port)| host)
+        .unwrap_or_else(|| authority.split(['/', '?', '#']).next().unwrap_or(""));
+
+    let is_loopback =
+        matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1") || host.starts_with("127.");
+    if is_loopback {
+        return;
+    }
+
+    tracing::warn!(
+        url = %url,
+        "{what} is configured over plaintext http://. Credentials and transaction contents \
+         cross the network in the clear; use https:// outside a trusted network."
+    );
+}
 
 /// Extracts a `key=value` query parameter (e.g. `region=eu-west-1`,
 /// `address=0x…`) from an `&`-joined query string.

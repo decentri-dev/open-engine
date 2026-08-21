@@ -110,6 +110,7 @@ posts the transaction to an endpoint you run, and you decide.
 ```bash
 export SPONSOR_SIGNER='https://sponsor.example.com/sign?address=0xABC…'
 export SPONSOR_SIGNER_TOKEN=…        # sent as `Authorization: Bearer …`
+export SPONSOR_SIGNER_HMAC_SECRET=…  # see Authenticating outbound requests
 ```
 
 `address` is required — it is the address your signatures recover to, and the
@@ -175,6 +176,7 @@ permission before using it:
 export SPONSOR_SIGNER=aws-kms:alias/sponsor?region=eu-west-1
 export SPONSOR_POLICY_WEBHOOK='https://policy.example.com/decide?timeout_ms=2000'
 export SPONSOR_POLICY_WEBHOOK_TOKEN=…
+export SPONSOR_POLICY_WEBHOOK_HMAC_SECRET=…
 ```
 
 **Request** — `POST`, with the cost figure already computed so your endpoint does
@@ -226,6 +228,52 @@ it cannot spend your money whatever it does.
 
 They compose: a webhook in front of a KMS key gives custom policy over a key you
 still control the custody of.
+
+#### Authenticating outbound requests
+
+Both outbound endpoints — the `https:` sponsor signer and the policy webhook —
+are authenticated the same way, by the same code.
+
+**Bearer token** (`*_TOKEN`) is sent as `Authorization: Bearer …`. Simple, and
+the credential itself travels on every request: anything that records a request
+records something that can forge every future one.
+
+**HMAC signature** (`*_HMAC_SECRET`) adds two headers:
+
+```
+X-Open-Engine-Timestamp: 1787251737
+X-Open-Engine-Signature: sha256=<hex>
+```
+
+The signature is `HMAC-SHA256(secret, "{timestamp}.{raw_body}")` over the exact
+bytes on the wire. To verify, recompute it from the raw body — not from a
+re-serialized parse, which will differ in key order and fail for reasons neither
+side can see — and compare in constant time. Reject a timestamp outside a
+tolerance window (5 minutes is typical) to bound replay, and keep both clocks on
+NTP.
+
+```python
+expected = hmac.new(secret.encode(), f"{ts}.".encode() + raw_body, hashlib.sha256).hexdigest()
+if not hmac.compare_digest(f"sha256={expected}", header): reject()
+if abs(time.time() - int(ts)) > 300: reject()
+```
+
+The timestamp is inside the digest, not merely alongside it — otherwise an
+attacker replays an old body under a fresh timestamp with the signature still
+valid.
+
+The two mechanisms are independent and stack. Both are optional, and the engine
+warns at startup when signing is off, because **the sponsor signer endpoint hands
+back a usable sponsor signature**: anyone who can forge a request to it gets a
+transaction paid for out of the sponsor's funds. The engine also warns when
+either endpoint is configured over plaintext `http://` (loopback excepted, since
+that is how they are tested).
+
+Not implemented, and deliberately: asymmetric signatures and mTLS. Both are
+stronger, and both carry key-distribution and certificate-rotation burdens that
+HMAC-plus-timestamp does not — see [webhooks.fyi](https://webhooks.fyi/security/intro),
+whose own ratings put them at "very high complexity" and "overkill for most
+webhook use-cases".
 
 #### Deployment posture and sponsor policy
 

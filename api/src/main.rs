@@ -11,6 +11,7 @@ mod policy_store;
 
 use open_engine_core::{
     domain::FrameTransaction,
+    http::Credentials,
     gateway::{AlloyGateway, ChainGateway, FailoverGateway},
     policy::{PolicyAuthority, PolicyStore, Posture, SponsorPolicy},
     signer::{Signer, SignerError, SponsorSigner},
@@ -952,10 +953,11 @@ async fn build_sponsor_policy(
         .ok()
         .filter(|uri| !uri.is_empty())
         .map(|uri| {
-            let token = std::env::var("SPONSOR_POLICY_WEBHOOK_TOKEN")
-                .ok()
-                .filter(|token| !token.is_empty());
-            let authority = PolicyAuthority::from_uri(&uri, token)
+            let credentials = Credentials::from_env(
+                "SPONSOR_POLICY_WEBHOOK_TOKEN",
+                "SPONSOR_POLICY_WEBHOOK_HMAC_SECRET",
+            );
+            let authority = PolicyAuthority::from_uri(&uri, credentials)
                 .unwrap_or_else(|e| panic!("SPONSOR_POLICY_WEBHOOK is unusable: {e}"));
             tracing::info!(authority = ?authority, "Sponsor policy webhook configured");
             Arc::new(authority)

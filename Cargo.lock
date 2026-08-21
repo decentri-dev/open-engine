@@ -3465,9 +3465,11 @@ name = "open_engine_core"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "hmac 0.12.1",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
