@@ -154,39 +154,89 @@ pub(crate) async fn post_signed<T: Serialize>(
         .map_err(|e| format!("{url} did not answer: {e}"))
 }
 
-/// Warns when an endpoint is configured over plaintext HTTP.
-///
-/// Loopback is exempt: a local endpoint is how these are tested, and nothing
-/// leaves the machine. Anywhere else, a bearer token is sent in the clear on
-/// every request, and an HMAC signature — while not itself secret — is
-/// verifying a body any observer can read and modify.
-///
-/// A warning rather than a refusal: this is operator-set configuration, not
-/// caller input, and an operator with a reason to run plaintext inside a trusted
-/// network should not be blocked by this code.
-pub(crate) fn warn_if_plaintext(url: &str, what: &str) {
-    let Some(authority) = url.strip_prefix("http://") else {
-        return;
-    };
-    let host = authority
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("")
-        .rsplit_once(':')
-        .map(|(host, _port)| host)
-        .unwrap_or_else(|| authority.split(['/', '?', '#']).next().unwrap_or(""));
+/// Environment escape hatch for plaintext to a non-loopback host.
+pub const PLAINTEXT_OPT_OUT: &str = "SPONSOR_ALLOW_PLAINTEXT_HTTP";
 
-    let is_loopback =
-        matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1") || host.starts_with("127.");
-    if is_loopback {
-        return;
+/// The host of an `authority` component, without userinfo or port.
+///
+/// IPv6 literals are bracketed (`[::1]:8080`), so the closing bracket — not the
+/// last colon — ends the host. Splitting on the last colon would return `[:` for
+/// an unbracketed-looking `[::1]`.
+fn host_of(authority: &str) -> &str {
+    let host_port = authority.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = host_port
+        .rsplit_once('@')
+        .map(|(_userinfo, host)| host)
+        .unwrap_or(host_port);
+
+    match host_port.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => host_port.split(':').next().unwrap_or(""),
+    }
+}
+
+fn is_loopback(host: &str) -> bool {
+    host == "localhost" || host == "::1" || host.starts_with("127.")
+}
+
+/// Checks an outbound endpoint is safe to send credentials to, before anything
+/// is sent.
+///
+/// `https://` always passes. Plaintext passes to loopback, which is how these
+/// endpoints are tested and how a localhost sidecar is addressed — nothing
+/// leaves the machine either way.
+///
+/// Plaintext to anywhere else **fails**, rather than warning. A bearer token
+/// crosses the network in the clear on every request, and a startup warning is
+/// precisely the thing nobody reads; this codebase already aborts boot rather
+/// than warn when `public` posture is missing its guards, and shipping a
+/// credential in cleartext deserves the same answer.
+///
+/// The opt-out exists because one correctly-secured deployment looks exactly
+/// like the broken one: under a service mesh the process calls
+/// `http://svc.ns.svc.cluster.local` and a sidecar transparently applies mTLS,
+/// so the address is remote, the scheme is plaintext, and the hop is encrypted
+/// by infrastructure this code cannot see. Refusing that outright would break
+/// deployments that are already doing the right thing, so it is allowed —
+/// deliberately, by name, and loudly.
+pub(crate) fn validate_endpoint(url: &str, what: &str) -> Result<(), String> {
+    if url.starts_with("https://") {
+        return Ok(());
     }
 
-    tracing::warn!(
-        url = %url,
-        "{what} is configured over plaintext http://. Credentials and transaction contents \
-         cross the network in the clear; use https:// outside a trusted network."
-    );
+    let Some(authority) = url.strip_prefix("http://") else {
+        return Err(format!(
+            "{what} must be an http:// or https:// URL, got '{url}'"
+        ));
+    };
+
+    let host = host_of(authority);
+    if host.is_empty() {
+        return Err(format!("{what} has no host: '{url}'"));
+    }
+    if is_loopback(host) {
+        return Ok(());
+    }
+
+    let opted_out = std::env::var(PLAINTEXT_OPT_OUT)
+        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        .unwrap_or(false);
+
+    if opted_out {
+        tracing::warn!(
+            url = %url,
+            "{what} is plaintext http:// to a remote host, allowed by {PLAINTEXT_OPT_OUT}. \
+             Credentials cross the network in the clear unless something outside this process \
+             (a service mesh or sidecar) is encrypting the hop."
+        );
+        return Ok(());
+    }
+
+    Err(format!(
+        "{what} is configured over plaintext http:// to {host}, so credentials and transaction \
+         contents would cross the network in the clear. Use https://, or set {PLAINTEXT_OPT_OUT}=true \
+         if a service mesh or sidecar already encrypts this hop."
+    ))
 }
 
 /// Extracts a `key=value` query parameter (e.g. `region=eu-west-1`,

@@ -113,7 +113,7 @@ impl PolicyAuthority {
             crate::http::timeout_secs_from_query(query, POLICY_WEBHOOK_DEFAULT_TIMEOUT_SECS)?;
         let client = crate::http::build_client(timeout_secs)?;
 
-        crate::http::warn_if_plaintext(endpoint, "The sponsor policy webhook");
+        crate::http::validate_endpoint(endpoint, "The sponsor policy webhook")?;
         if !credentials.is_signed() {
             tracing::warn!(
                 url = %endpoint,

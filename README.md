@@ -265,9 +265,24 @@ valid.
 The two mechanisms are independent and stack. Both are optional, and the engine
 warns at startup when signing is off, because **the sponsor signer endpoint hands
 back a usable sponsor signature**: anyone who can forge a request to it gets a
-transaction paid for out of the sponsor's funds. The engine also warns when
-either endpoint is configured over plaintext `http://` (loopback excepted, since
-that is how they are tested).
+transaction paid for out of the sponsor's funds.
+
+**Transport.** Both endpoints must be `https://`. Plaintext `http://` is accepted
+only to loopback — how these are tested, and how a localhost sidecar is
+addressed. Plaintext to any other host **aborts startup**, rather than warning:
+the bearer token crosses the network in the clear on every request, and a warning
+in a startup log is the thing nobody reads.
+
+One correctly-secured deployment looks exactly like the broken one, so there is a
+named escape hatch. Under a service mesh the process calls
+`http://svc.ns.svc.cluster.local` and a sidecar transparently applies mTLS —
+remote address, plaintext scheme, encrypted hop. Set
+`SPONSOR_ALLOW_PLAINTEXT_HTTP=true` for that case; it is allowed deliberately, by
+name, and logs a warning each time.
+
+Anything that is not an `http://` or `https://` URL is rejected at startup too. It
+used to be accepted and fail on the first real request, where a typo read as a
+permanent outage rather than a misconfiguration.
 
 Not implemented, and deliberately: asymmetric signatures and mTLS. Both are
 stronger, and both carry key-distribution and certificate-rotation burdens that

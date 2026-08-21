@@ -189,7 +189,7 @@ impl RemoteSigner {
         timeout_secs: u64,
     ) -> Result<Self, SignerError> {
         let client = http::build_client(timeout_secs).map_err(SignerError::InitError)?;
-        http::warn_if_plaintext(&url, "The sponsor authority");
+        http::validate_endpoint(&url, "The sponsor authority").map_err(SignerError::InitError)?;
 
         // This endpoint hands back a usable sponsor signature, so anyone able to
         // forge a request to it gets their transaction paid for. A bearer token
