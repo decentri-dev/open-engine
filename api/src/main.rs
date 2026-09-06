@@ -7,6 +7,7 @@ use axum::{
 };
 use broadcaster::{worker::BroadcasterError, BroadcastOutcome, MempoolBroadcaster};
 use compiler::{CompilerError, FrameCompiler};
+mod rate_limit;
 mod policy_store;
 
 use open_engine_core::{
@@ -22,6 +23,7 @@ use queue::{
     job::{JobErrorRecord, JobErrorType, JobOptions},
     JobState, PushOutcome, Queue, ReplaceOutcome,
 };
+use rate_limit::RateLimiter;
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -64,6 +66,7 @@ enum ApiError {
     /// one unchanged rather than treat their transaction as rejected.
     Unavailable(String),
     Internal(String),
+    TooManyRequests(String),
 }
 
 impl IntoResponse for ApiError {
@@ -72,6 +75,7 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
             ApiError::NotFound(message) => (StatusCode::NOT_FOUND, message),
             ApiError::Unavailable(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
+            ApiError::TooManyRequests(message) => (StatusCode::TOO_MANY_REQUESTS, message),
             ApiError::Internal(detail) => {
                 tracing::error!(error = %detail, "Internal error handling transaction request");
                 (
@@ -161,6 +165,7 @@ struct AppState {
     queue: Arc<AppQueue>,
     tx_received: Arc<AtomicU64>,
     tx_queued: Arc<AtomicU64>,
+    rate_limiter: RateLimiter,
 }
 
 /// Lets a handler ask for just the queue instead of the whole [`AppState`].
@@ -422,8 +427,29 @@ async fn handle_metrics(State(state): State<AppState>) -> String {
 /// Strictly accepts a fully structured EIP-8141 FrameTransaction payload from the SDK.
 async fn handle_transaction(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    connect_info: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     Json(payload): Json<FrameTransaction>,
 ) -> Result<(StatusCode, Json<TransactionResponse>), ApiError> {
+    let api_key = headers
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "));
+
+    let ip = headers
+        .get("X-Forwarded-For")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or("").trim().to_string())
+        .unwrap_or_else(|| {
+            connect_info
+                .map(|c| c.0.ip().to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        });
+
+    if let Err(e) = state.rate_limiter.check(&ip, api_key).await {
+        return Err(ApiError::TooManyRequests(e));
+    }
+
     tracing::info!(
         sender = %payload.sender,
         chain_id = payload.chain_id,
@@ -1068,17 +1094,22 @@ async fn main() {
 
     let queue = AppQueue::builder()
         .name("frames")
-        .redis_url(redis_url)
+        .redis_url(redis_url.clone())
         .handler(broadcaster)
         .build()
         .await
         .expect("Failed to initialize queue");
+
+    let client = queue::redis::Client::open(redis_url.as_str()).unwrap();
+    let redis_conn = client.get_connection_manager().await.unwrap();
+    let rate_limiter = RateLimiter::new(redis_conn);
 
     let state = AppState {
         compiler,
         queue: Arc::new(queue),
         tx_received: Arc::new(AtomicU64::new(0)),
         tx_queued: Arc::new(AtomicU64::new(0)),
+        rate_limiter,
     };
 
     // Start the Queue Worker
@@ -1096,7 +1127,7 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3001").await.unwrap();
     tracing::info!("Listening on 0.0.0.0:3001");
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
 }
 
 /// Drives the real router over HTTP against a real Redis-backed queue.
@@ -1284,11 +1315,16 @@ mod http_tests {
                     .expect("Redis must be running on 127.0.0.1:6379 for this test"),
             );
 
+            let client = queue::redis::Client::open(REDIS_URL).unwrap();
+            let redis_conn = client.get_connection_manager().await.unwrap();
+            let rate_limiter = RateLimiter::new(redis_conn);
+
             let state = AppState {
                 compiler: Arc::new(AppCompiler::relay_only(gateway)),
                 queue: queue.clone(),
                 tx_received: Arc::new(AtomicU64::new(0)),
                 tx_queued: Arc::new(AtomicU64::new(0)),
+                rate_limiter,
             };
 
             let app = Router::new()
