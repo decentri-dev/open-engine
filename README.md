@@ -500,6 +500,10 @@ docker run --rm -p 6379:6379 redis:7-alpine
   cargo bench -p queue
   ```
 
+## Contributing
+
+We welcome contributions! Please see our [CONTRIBUTING.md](CONTRIBUTING.md) for details on how to get started, format your code, and submit pull requests.
+
 ## License
 
 This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for details.
