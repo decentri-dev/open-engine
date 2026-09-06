@@ -1115,7 +1115,7 @@ mod http_tests {
     use alloy::primitives::B256;
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
-    use open_engine_core::domain::{Frame, FrameMode};
+    use open_engine_core::domain::{Frame, FrameMode, FRAME_SIG_SCHEME_SECP256K1};
     use open_engine_core::gateway::MockGateway;
     use queue::redis;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1319,7 +1319,7 @@ mod http_tests {
                 blob_versioned_hashes: vec![],
                 recent_root_references: vec![],
                 signatures: vec![open_engine_core::domain::FrameSignature {
-                    scheme: 0,
+                    scheme: FRAME_SIG_SCHEME_SECP256K1,
                     signer: FUNDED_SENDER.to_string(),
                     msg: String::new(),
                     signature: String::new(),

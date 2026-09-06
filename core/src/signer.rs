@@ -61,13 +61,19 @@ pub trait Signer: Send + Sync {
     }
 }
 
-/// Re-encodes an alloy signature (`r || s || v`) into the EIP-8141 frame
-/// signature layout (`v || r || s`).
+/// Re-encodes an alloy signature into the EIP-8141 frame signature layout
+/// (`v || r || s`).
+///
+/// Reads `as_rsy`, NOT `as_bytes`: EIP-8141 requires `v` to be a bare recovery
+/// id (0 or 1) and the node refuses anything above 1, while `as_bytes` returns
+/// `v` in Electrum notation (27 or 28). The two differ in one byte at the end of
+/// a 65-byte array, and picking the wrong one costs the sponsor every
+/// transaction it signs.
 fn to_frame_signature(signature: alloy::primitives::Signature) -> Bytes {
-    let rsv = signature.as_bytes();
+    let rsy = signature.as_rsy();
     let mut vrs = Vec::with_capacity(65);
-    vrs.push(rsv[64]);
-    vrs.extend_from_slice(&rsv[..64]);
+    vrs.push(rsy[64]);
+    vrs.extend_from_slice(&rsy[..64]);
     Bytes::from(vrs)
 }
 
@@ -594,9 +600,13 @@ mod tests {
         assert!(result.is_ok());
         let signature = result.unwrap();
         assert_eq!(signature.len(), 65);
+        // `v || r || s`, and `v` is a BARE recovery id. EIP-8141 canonicality
+        // refuses anything above 1, so Electrum notation (27/28) — what alloy's
+        // `as_bytes` hands back — fails every signature check at the node.
         assert!(
-            signature[0] == 27 || signature[0] == 28,
-            "Frame signatures are encoded as v || r || s"
+            signature[0] <= 1,
+            "v must be a bare recovery id, got {}",
+            signature[0]
         );
     }
 

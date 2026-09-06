@@ -7,7 +7,9 @@
 //! differs is only who holds the key, and that is invisible from here.
 
 use alloy::primitives::{Address, U256};
-use open_engine_core::domain::{Frame, FrameMode, FrameSignature, FrameTransaction, PayerIntent};
+use open_engine_core::domain::{
+    Frame, FrameMode, FrameSignature, FrameTransaction, PayerIntent, FRAME_SIG_SCHEME_SECP256K1,
+};
 use open_engine_core::http::Credentials;
 use open_engine_core::policy::{PolicyAuthority, PolicyError, SponsorPolicy};
 use std::sync::Arc;
@@ -78,7 +80,7 @@ fn tx() -> FrameTransaction {
         recent_root_references: vec![],
         payer: Some(PayerIntent::Sponsor),
         signatures: vec![FrameSignature {
-            scheme: 0,
+            scheme: FRAME_SIG_SCHEME_SECP256K1,
             signer: SPONSOR.to_string(),
             msg: String::new(),
             signature: String::new(),

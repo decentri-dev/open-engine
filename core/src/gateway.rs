@@ -516,7 +516,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "Requires a local ethrex node with --http.api ethrex on :8545"]
     async fn simulate_frame_transaction_round_trip() {
-        use crate::domain::{Frame, FrameMode, FrameSignature, FrameTransaction};
+        use crate::domain::{
+            Frame, FrameMode, FrameSignature, FrameTransaction, FRAME_SIG_SCHEME_SECP256K1,
+        };
         use alloy::primitives::U256;
 
         let gateway = super::AlloyGateway::new("http://localhost:8545");
@@ -547,7 +549,7 @@ mod tests {
                 data: "0x".to_string(),
             }],
             signatures: vec![FrameSignature {
-                scheme: 0,
+                scheme: FRAME_SIG_SCHEME_SECP256K1,
                 signer: sender,
                 msg: "".to_string(),
                 signature: "0x1234".to_string(),

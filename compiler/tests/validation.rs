@@ -5,6 +5,7 @@ use alloy::primitives::{U256};
 use compiler::FrameCompiler;
 use open_engine_core::domain::{
     Frame, FrameMode, FrameSignature, FrameTransaction, PayerIntent, EXPIRY_VERIFIER_ADDRESS,
+    FRAME_SIG_SCHEME_SECP256K1,
 };
 use open_engine_core::signer::InMemorySigner;
 use std::sync::Arc;
@@ -45,7 +46,7 @@ async fn calldata_cost_enforcement() {
             data: "0x".to_string(),
         }],
         signatures: vec![FrameSignature {
-            scheme: 0,
+            scheme: FRAME_SIG_SCHEME_SECP256K1,
             signer: sender.clone(),
             msg: "".to_string(),
             signature: "0x".to_string(),
@@ -98,7 +99,7 @@ async fn default_budget_admits_heavy_verify_prefix() {
             data: "0x".to_string(),
         }],
         signatures: vec![FrameSignature {
-            scheme: 0,
+            scheme: FRAME_SIG_SCHEME_SECP256K1,
             signer: sender,
             msg: "".to_string(),
             signature: "0x".to_string(),
@@ -143,7 +144,7 @@ async fn missing_fees_are_rejected() {
             data: "0x".to_string(),
         }],
         signatures: vec![FrameSignature {
-            scheme: 0,
+            scheme: FRAME_SIG_SCHEME_SECP256K1,
             signer: sender,
             msg: "".to_string(),
             signature: "0x".to_string(),
@@ -186,7 +187,7 @@ async fn malformed_frame_data_is_rejected() {
             data: "0xnot-hex".to_string(),
         }],
         signatures: vec![FrameSignature {
-            scheme: 0,
+            scheme: FRAME_SIG_SCHEME_SECP256K1,
             signer: sender,
             msg: "".to_string(),
             signature: "0x".to_string(),
@@ -245,7 +246,7 @@ async fn strict_expiry_verifier_address() {
             },
         ],
         signatures: vec![FrameSignature {
-            scheme: 0,
+            scheme: FRAME_SIG_SCHEME_SECP256K1,
             signer: sender.clone(),
             msg: "".to_string(),
             signature: "0x".to_string(),
@@ -304,7 +305,7 @@ async fn canonical_expiry_verifier_address() {
             },
         ],
         signatures: vec![FrameSignature {
-            scheme: 0,
+            scheme: FRAME_SIG_SCHEME_SECP256K1,
             signer: sender.clone(),
             msg: "".to_string(),
             signature: "0x".to_string(),
@@ -357,7 +358,7 @@ async fn a_declined_simulation_is_not_a_rejection() {
             data: "0x".to_string(),
         }],
         signatures: vec![FrameSignature {
-            scheme: 0,
+            scheme: FRAME_SIG_SCHEME_SECP256K1,
             signer: sender.clone(),
             msg: "".to_string(),
             signature: "0x".to_string(),

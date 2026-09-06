@@ -1,7 +1,9 @@
 use alloy::primitives::Address;
 use broadcaster::worker::MempoolBroadcaster;
 use compiler::FrameCompiler;
-use open_engine_core::domain::{Frame, FrameMode, FrameSignature, FrameTransaction, PayerIntent};
+use open_engine_core::domain::{
+    Frame, FrameMode, FrameSignature, FrameTransaction, PayerIntent, FRAME_SIG_SCHEME_SECP256K1,
+};
 use open_engine_core::encoding::Eip8141Encoder;
 use open_engine_core::gateway::{AlloyGateway, ChainGateway};
 use open_engine_core::signer::{InMemorySigner, Signer};
@@ -69,7 +71,7 @@ async fn end_to_end_flow() {
         // top-level SECP256K1 signature over the canonical sig hash (empty
         // `msg`). Filled below once the transaction is fully assembled.
         signatures: vec![FrameSignature {
-            scheme: 0,
+            scheme: FRAME_SIG_SCHEME_SECP256K1,
             signer: sender.to_string(),
             msg: "".to_string(),
             signature: "".to_string(),

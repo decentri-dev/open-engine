@@ -3,7 +3,9 @@ use common::{MockGateway, DUMMY_SENDER, SPONSOR_KEY};
 
 use alloy::primitives::U256;
 use compiler::{CompilerError, FrameCompiler};
-use open_engine_core::domain::{Frame, FrameMode, FrameSignature, FrameTransaction, PayerIntent};
+use open_engine_core::domain::{
+    Frame, FrameMode, FrameSignature, FrameTransaction, PayerIntent, FRAME_SIG_SCHEME_SECP256K1,
+};
 use open_engine_core::policy::SponsorPolicy;
 use open_engine_core::signer::{InMemorySigner, Signer};
 use std::sync::Arc;
@@ -28,7 +30,7 @@ fn sponsored_tx(paymaster: &str, payer: PayerIntent) -> FrameTransaction {
         blob_versioned_hashes: vec![],
         recent_root_references: vec![],
         signatures: vec![FrameSignature {
-            scheme: 0,
+            scheme: FRAME_SIG_SCHEME_SECP256K1,
             signer: paymaster.to_string(),
             msg: "".to_string(),
             signature: "".to_string(),

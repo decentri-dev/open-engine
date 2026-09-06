@@ -8,7 +8,9 @@
 
 use alloy::primitives::{B256, U256};
 use hmac::{Hmac, Mac};
-use open_engine_core::domain::{Frame, FrameMode, FrameSignature, FrameTransaction, PayerIntent};
+use open_engine_core::domain::{
+    Frame, FrameMode, FrameSignature, FrameTransaction, PayerIntent, FRAME_SIG_SCHEME_SECP256K1,
+};
 use open_engine_core::http::{Credentials, SIGNATURE_HEADER, TIMESTAMP_HEADER};
 use open_engine_core::policy::{PolicyAuthority, SponsorPolicy};
 use open_engine_core::signer::{RemoteSigner, Signer};
@@ -98,7 +100,7 @@ fn tx() -> FrameTransaction {
         recent_root_references: vec![],
         payer: Some(PayerIntent::Sponsor),
         signatures: vec![FrameSignature {
-            scheme: 0,
+            scheme: FRAME_SIG_SCHEME_SECP256K1,
             signer: SPONSOR.to_string(),
             msg: String::new(),
             signature: String::new(),

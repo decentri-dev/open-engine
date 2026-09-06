@@ -4,7 +4,9 @@ use common::{MockGateway, DUMMY_SENDER, SPONSOR_KEY};
 use alloy::primitives::{B256};
 use broadcaster::{BroadcastOutcome, MempoolBroadcaster};
 use compiler::FrameCompiler;
-use open_engine_core::domain::{Frame, FrameMode, FrameSignature, FrameTransaction, PayerIntent};
+use open_engine_core::domain::{
+    Frame, FrameMode, FrameSignature, FrameTransaction, PayerIntent, FRAME_SIG_SCHEME_SECP256K1,
+};
 use open_engine_core::signer::{InMemorySigner, Signer};
 use queue::DurableExecution;
 use std::sync::Arc;
@@ -126,7 +128,7 @@ async fn compiles_and_queues_sponsored_tx() {
         blob_versioned_hashes: vec![],
         recent_root_references: vec![],
         signatures: vec![FrameSignature {
-            scheme: 0, // SECP256K1
+            scheme: FRAME_SIG_SCHEME_SECP256K1,
             signer: paymaster.clone(),
             msg: "".to_string(),
             signature: "".to_string(), // Empty, compiler will fill this

@@ -1,6 +1,7 @@
 use alloy::primitives::Address;
 use open_engine_core::domain::{
     Frame, FrameMode, FrameTransaction, PayerIntent, EXPIRY_VERIFIER_ADDRESS,
+    FRAME_SIG_SCHEME_ARBITRARY, FRAME_SIG_SCHEME_P256, FRAME_SIG_SCHEME_SECP256K1,
     FRAME_TX_INTRINSIC_COST, FRAME_TX_MAX_FRAMES, FRAME_TX_MAX_NONCE_KEYS,
     FRAME_TX_MAX_RECENT_ROOT_REFERENCES, FRAME_TX_PER_FRAME_COST, MAX_VERIFY_GAS, TX_GAS_LIMIT_CAP,
 };
@@ -329,21 +330,21 @@ impl<G: ChainGateway + Send + Sync, S: Signer + Send + Sync> FrameCompiler<G, S>
             )));
         }
 
-        // EIP-8141: Signature Validation
-        // Explicitly map known schemes to their specified gas costs. Unknown schemes must be rejected.
-        let mut signature_verification_cost: u64 = 0;
+        // EIP-8141: Signature Validation. Rejecting an unknown scheme is this
+        // loop's job; pricing a known one is not, so the gas table stays in
+        // core and the two cannot drift apart.
         for sig in &tx.signatures {
-            if sig.scheme == 0x0 {
-                signature_verification_cost += 2800; // SECP256K1
-            } else if sig.scheme == 0x1 {
-                signature_verification_cost += 6700; // P256
-            } else {
+            if !matches!(
+                sig.scheme,
+                FRAME_SIG_SCHEME_ARBITRARY | FRAME_SIG_SCHEME_SECP256K1 | FRAME_SIG_SCHEME_P256
+            ) {
                 return Err(CompilerError::Validation(format!(
                     "Invalid signature scheme: {}",
                     sig.scheme
                 )));
             }
         }
+        let signature_verification_cost = tx.signature_verification_cost();
 
         let signatures_rlp = Eip8141Encoder::encode_signatures(&tx.signatures);
         let frames_rlp = Eip8141Encoder::encode_frames(&tx.frames);

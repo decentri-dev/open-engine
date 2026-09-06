@@ -6,7 +6,9 @@
 //! sponsor's blip into a permanent rejection.
 
 use alloy::primitives::{Address, B256, U256};
-use open_engine_core::domain::{Frame, FrameMode, FrameSignature, FrameTransaction, PayerIntent};
+use open_engine_core::domain::{
+    Frame, FrameMode, FrameSignature, FrameTransaction, PayerIntent, FRAME_SIG_SCHEME_SECP256K1,
+};
 use open_engine_core::http::Credentials;
 use open_engine_core::signer::{RemoteSigner, Signer, SignerError, SponsorSigner};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -84,7 +86,7 @@ fn sponsored_tx() -> FrameTransaction {
         recent_root_references: vec![],
         payer: Some(PayerIntent::Sponsor),
         signatures: vec![FrameSignature {
-            scheme: 0,
+            scheme: FRAME_SIG_SCHEME_SECP256K1,
             signer: SPONSOR.to_string(),
             msg: String::new(),
             signature: String::new(),

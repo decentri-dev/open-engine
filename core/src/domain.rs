@@ -51,11 +51,26 @@ pub const FRAME_TX_MAX_RECENT_ROOT_REFERENCES: usize = 16;
 /// when any reference is present, plus a per-reference charge. Mirrors the
 /// network's admission accounting so [`FrameTransaction::total_gas_limit`]
 /// matches what the node computes.
-pub const FRAME_TX_RECENT_ROOT_REFERENCE_ADDRESS_GAS: u64 = 2400;
-pub const FRAME_TX_RECENT_ROOT_REFERENCE_GAS: u64 = 1900 + 2 * 30 + 7 * 6;
+///
+/// The two access-list parameters these are built from — `ACCESS_LIST_ADDRESS_COST`
+/// and `ACCESS_LIST_STORAGE_KEY_COST` — are 3000 from Amsterdam onward (EIP-8038),
+/// and frame transactions exist only from Hegota, which is after Amsterdam, so the
+/// raised values always apply. The pre-Amsterdam 2400/1900 undercharged.
+pub const FRAME_TX_RECENT_ROOT_REFERENCE_ADDRESS_GAS: u64 = 3000;
+pub const FRAME_TX_RECENT_ROOT_REFERENCE_GAS: u64 = 3000 + 2 * 30 + 7 * 6;
+
+/// EIP-8141 signature schemes, numbered as the node numbers them. An earlier
+/// revision of the spec put SECP256K1 at 0 and P256 at 1; a node on the current
+/// revision refuses an ARBITRARY entry that names a signer and reads a P256 blob
+/// tagged 1 as a 65-byte secp256k1 signature, so the old numbers fail on-chain
+/// rather than merely mispricing.
+pub const FRAME_SIG_SCHEME_ARBITRARY: u8 = 0;
+pub const FRAME_SIG_SCHEME_SECP256K1: u8 = 1;
+pub const FRAME_SIG_SCHEME_P256: u8 = 2;
 
 /// EIP-8141 signature-verification gas by scheme (used in the gas total and the
-/// validation-prefix budget): SECP256K1 = 2800, P256 = 6700.
+/// validation-prefix budget): ARBITRARY = 100, SECP256K1 = 2800, P256 = 6700.
+pub const FRAME_SIG_COST_ARBITRARY: u64 = 100;
 pub const FRAME_SIG_COST_SECP256K1: u64 = 2800;
 pub const FRAME_SIG_COST_P256: u64 = 6700;
 
@@ -454,20 +469,36 @@ impl FrameTransaction {
         self.signatures
             .iter()
             .map(|sig| match sig.scheme {
-                0 => FRAME_SIG_COST_SECP256K1,
-                1 => FRAME_SIG_COST_P256,
+                FRAME_SIG_SCHEME_ARBITRARY => FRAME_SIG_COST_ARBITRARY,
+                FRAME_SIG_SCHEME_SECP256K1 => FRAME_SIG_COST_SECP256K1,
+                FRAME_SIG_SCHEME_P256 => FRAME_SIG_COST_P256,
                 _ => 0,
             })
             .fold(0u64, u64::saturating_add)
     }
 
-    /// Total gas the payer may be charged for, mirroring the network's admission
-    /// accounting (saturating): intrinsic + per-frame + calldata (frames +
-    /// signatures + recent-root references) + signature verification + the sum
-    /// of all frame gas limits + recent-root intrinsic gas.
+    /// Total gas the payer may be charged for (saturating): intrinsic +
+    /// per-frame + calldata (frames + signatures + recent-root references) +
+    /// signature verification + the sum of all frame gas limits + recent-root
+    /// intrinsic gas.
     ///
-    /// Kept byte-for-byte aligned with the node so [`Self::max_cost`] and the
-    /// compiler's simulation cross-check agree with what the mempool computes.
+    /// A close estimate of the node's reservation, NOT a reproduction of it, and
+    /// nothing compares the two — it feeds only the sponsor policy's ceiling and
+    /// budget reservation. Two known divergences, both dwarfed by the frame gas
+    /// limits in any realistic transaction:
+    ///
+    ///  - The node charges the calldata cost over the data *fields* — each
+    ///    frame's `data`, each signature's `signer`/`msg`/`signature` — plus
+    ///    `rlp(nonce_keys) || rlp(nonce_seq)`. This charges over the whole RLP
+    ///    encoding of the frames and signatures instead, and omits the nonce
+    ///    calldata: it over-counts RLP framing and under-counts by ~35 bytes.
+    ///  - The node reserves `max(standard_gas_limit, calldata_floor_gas)` per
+    ///    EIP-7623; there is no floor here. It binds only when data bytes are
+    ///    worth more than the declared frame gas (roughly 48 gas per byte), so a
+    ///    data-heavy transaction with small frame limits would reserve more at
+    ///    the node than this predicts — the one case where a sponsor budget
+    ///    under-reserves. Worth closing if this engine ever sponsors traffic it
+    ///    does not build itself.
     pub fn total_gas_limit(&self) -> u64 {
         use crate::encoding::Eip8141Encoder;
 
@@ -689,12 +720,34 @@ mod tests {
                 data: "0x".to_string(),
             }],
             signatures: vec![FrameSignature {
-                scheme: 0,
+                scheme: FRAME_SIG_SCHEME_SECP256K1,
                 signer: "0x1111111111111111111111111111111111111111".to_string(),
                 msg: "".to_string(),
                 signature: "0x1234".to_string(),
             }],
         }
+    }
+
+    /// Pins the scheme numbers to the node's, deliberately with literals: the
+    /// constants alone would follow a renumbering silently, and a signature list
+    /// priced under the old numbering (SECP256K1 at 0, P256 at 1) is not merely
+    /// mispriced — the node refuses it.
+    #[test]
+    fn each_scheme_is_priced_by_its_wire_number() {
+        let mut tx = sample_tx();
+        let template = tx.signatures[0].clone();
+        tx.signatures = [0u8, 1, 2]
+            .into_iter()
+            .map(|scheme| FrameSignature {
+                scheme,
+                ..template.clone()
+            })
+            .collect();
+
+        assert_eq!(
+            tx.signature_verification_cost(),
+            FRAME_SIG_COST_ARBITRARY + FRAME_SIG_COST_SECP256K1 + FRAME_SIG_COST_P256
+        );
     }
 
     #[test]

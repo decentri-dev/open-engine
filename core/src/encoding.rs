@@ -1,4 +1,7 @@
-use crate::domain::{Frame, FrameMode, FrameSignature, FrameTransaction, RecentRootReference};
+use crate::domain::{
+    Frame, FrameMode, FrameSignature, FrameTransaction, RecentRootReference,
+    FRAME_SIG_SCHEME_ARBITRARY,
+};
 use alloy::primitives::{keccak256, Bytes, B256, U256};
 use alloy::rlp::{BufMut, Encodable};
 use thiserror::Error;
@@ -180,7 +183,19 @@ impl Eip8141Encoder {
         }
 
         for (i, sig) in tx.signatures.iter().enumerate() {
-            expect_hex_bytes(&format!("signatures[{i}].signer"), &sig.signer, Some(20))?;
+            // An ARBITRARY entry carries no protocol crypto and so no resolved
+            // signer; the node refuses one that names an address. Every other
+            // scheme resolves a signer, and an empty field there would silently
+            // resolve to tx.sender instead of the address the caller meant.
+            if sig.scheme == FRAME_SIG_SCHEME_ARBITRARY {
+                if !sig.signer.is_empty() && sig.signer != "0x" {
+                    return Err(WireFormatError(format!(
+                        "signatures[{i}]: ARBITRARY signatures must not name a signer"
+                    )));
+                }
+            } else {
+                expect_hex_bytes(&format!("signatures[{i}].signer"), &sig.signer, Some(20))?;
+            }
             // Empty msg means "signed over the canonical sig hash"; otherwise
             // it must be an explicit 32-byte digest.
             if !sig.msg.is_empty() && sig.msg != "0x" {
@@ -441,6 +456,8 @@ fn parse_u256_value(value: &str) -> U256 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{FRAME_SIG_SCHEME_ARBITRARY, FRAME_SIG_SCHEME_SECP256K1};
+
     fn create_test_tx() -> FrameTransaction {
         FrameTransaction {
             payer: None,
@@ -462,7 +479,7 @@ mod tests {
                 data: "0xdeadbeef".to_string(),
             }],
             signatures: vec![FrameSignature {
-                scheme: 0,
+                scheme: FRAME_SIG_SCHEME_SECP256K1,
                 signer: "0x1111111111111111111111111111111111111111".to_string(),
                 msg: "".to_string(),
                 signature: "0x1234".to_string(),
@@ -515,6 +532,19 @@ mod tests {
         tx.signatures[0].msg = "0x1234".to_string();
         let err = Eip8141Encoder::validate_wire_format(&tx).unwrap_err();
         assert!(err.to_string().contains("signatures[0].msg"), "{err}");
+    }
+
+    #[test]
+    fn an_arbitrary_signature_may_not_name_a_signer() {
+        // The node refuses this outright, so catching it here turns a rejected
+        // broadcast into a rejected request.
+        let mut tx = create_test_tx();
+        tx.signatures[0].scheme = FRAME_SIG_SCHEME_ARBITRARY;
+        let err = Eip8141Encoder::validate_wire_format(&tx).unwrap_err();
+        assert!(err.to_string().contains("must not name a signer"), "{err}");
+
+        tx.signatures[0].signer = String::new();
+        assert!(Eip8141Encoder::validate_wire_format(&tx).is_ok());
     }
 
     #[test]
