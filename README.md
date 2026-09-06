@@ -499,11 +499,3 @@ docker run --rm -p 6379:6379 redis:7-alpine
   ```bash
   cargo bench -p queue
   ```
-
-## Domain Specifics
-
-When modifying the engine, please refer to the project glossary in `CONTEXT.md`.
-- **Frame Transaction**: Native EIP-8141 transaction (Type `0x06`).
-- **Compiler**: Modifies and packages frames.
-- **Canonical Paymaster**: A paymaster instance is **canonical** iff the runtime code at the `pay` frame target exactly matches the canonical paymaster implementation (per the EIP-8141 specification). Canonical paymasters bypass the generic validation trace/opcode rules and instead use **paymaster-specific accounting and reservation rules**.
-- **Non-Canonical Paymaster**: Any paymaster whose runtime code does not exactly match the canonical implementation. In the public mempool, EIP-8141 limits this by pending transactions **in the mempool using this paymaster**, with `MAX_PENDING_TXS_USING_NON_CANONICAL_PAYMASTER = 1`.
