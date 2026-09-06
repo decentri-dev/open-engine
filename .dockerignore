@@ -1,0 +1,8 @@
+# Ignore build artifacts and git history
+target/
+.git/
+.github/
+.vscode/
+.idea/
+.claude/
+Dockerfile
