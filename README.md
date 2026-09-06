@@ -499,3 +499,7 @@ docker run --rm -p 6379:6379 redis:7-alpine
   ```bash
   cargo bench -p queue
   ```
+
+## License
+
+This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for details.
